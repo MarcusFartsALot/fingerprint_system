@@ -1,367 +1,352 @@
 """
-Fingerprint Enhancement System — Main Application (Module D: User Interface)
-================================================================================
-Author (team): Member D
+app.py
+------
+BMDS2133 Image Processing — Fingerprint Enhancement System (Mode A)
 
-Integrates:
-    Module A — Image Acquisition & Gradient-Based Ridge Orientation Estimation
-    Module B — Feature Detection (Minutiae + Singular Points)
-    Module C — Pattern Classification & Matching/Identification
-    Module D — This file: Streamlit UI, local SQLite database, PDF reporting,
-               batch processing, and video-frame ingestion.
+Tab 1: Algorithm Comparison — benchmarks the four enhancement algorithms
+        studied by the team DIRECTLY against fingerprint image(s) the user
+        uploads (no hardcoded/synthetic ground truth, and no synthetic
+        degradation step, anywhere in the pipeline). Each algorithm runs
+        standalone on every uploaded image exactly as uploaded, so the
+        comparison reflects real enhancement performance, not recovery of
+        an artificially-degraded copy.
+        Supports batch uploads (e.g. 100 images at once): every image is
+        scored individually against every algorithm, and the results are
+        averaged per algorithm to determine the best performer.
+        Produces Confusion Matrix, Accuracy/Precision/Recall/F1, a
+        no-reference Ridge Clarity Score, histograms, and a PDF export.
+Tab 2: Fingerprint Matching — placeholder ("Coming Soon") for the real
+        graduation-verification application described in the brief.
 
-Run with:
-    streamlit run app.py
+Run with:  streamlit run app.py
 """
 
-import os
-import tempfile
-from datetime import datetime
-
-import cv2
+import time
 import numpy as np
+import pandas as pd
 import streamlit as st
+from PIL import Image
 
-from modules import database
-from modules.acquisition_orientation import (generate_vector_overlay,
-                                              run_acquisition_pipeline)
-from modules.calibration import calibrate_image
-from modules.classification import classify_pattern
-from modules.matching import identify
-from modules.minutiae_detection import (detect_minutiae, draw_minutiae_overlay,
-                                         yolo_model_available)
-from modules.report import generate_report
-from modules.singular_points import detect_singular_points
-
-# ----------------------------------------------------------------
-# PAGE CONFIGURATION & THEMING
-# ----------------------------------------------------------------
-st.set_page_config(
-    page_title="Fingerprint Enhancement System",
-    layout="wide",
-    initial_sidebar_state="expanded"
+from algorithms import ALGORITHMS, binarize_otsu
+from evaluation import derive_pseudo_ground_truth_mask, ridge_clarity_score, load_and_resize
+from metrics_utils import (
+    compute_classification_metrics,
+    plot_confusion_matrices, plot_metric_bars, plot_clarity_bars,
+    plot_histograms, plot_sample_gallery,
 )
+from pdf_report import build_pdf_report
 
-st.markdown("""
-    <style>
-    .main-title { font-size: 32px; font-weight: 700; color: #00ff88; margin-bottom: 6px; }
-    .subtitle { color: #9a9a9a; margin-bottom: 20px; }
-    .section-header { font-size: 18px; font-weight: 600; border-left: 4px solid #00ff88; padding-left: 10px; margin-bottom: 15px; }
-    </style>
-""", unsafe_allow_html=True)
+IMAGE_LABEL = "Original (uploaded)"
 
-database.init_db()
+st.set_page_config(page_title="Fingerprint Enhancement Studio", layout="wide")
 
-st.markdown('<div class="main-title">🩻 Fingerprint Enhancement System</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">BMDS2133 Image Processing — Mode B Innovative Solution '
-            '(Topic 3: Fingerprint Enhancement System)</div>', unsafe_allow_html=True)
+st.title("Fingerprint Enhancement System")
+st.caption("BMDS2133 Image Processing — Mode A: Comparative & Enhancement Study")
 
-# ----------------------------------------------------------------
-# SIDEBAR — SHARED HYPERPARAMETERS (Module A controls, reused everywhere)
-# ----------------------------------------------------------------
-st.sidebar.header("🎛️ Algorithmic Hyperparameters")
+tab_compare, tab_app = st.tabs(["Algorithm Comparison", "Fingerprint Matching (Coming Soon)"])
 
-st.sidebar.subheader("1. Contrast Enhancement (CLAHE)")
-clip_limit = st.sidebar.slider("Clip Limit", 1.0, 10.0, 3.0, 0.5)
-tile_grid = st.sidebar.slider("Tile Grid Size", 4, 32, 8, 4)
+# =============================================================================
+# TAB 1 — ALGORITHM COMPARISON
+# =============================================================================
+with tab_compare:
 
-st.sidebar.subheader("2. Orientation Estimation")
-block_size = st.sidebar.slider("Window Block Size (W)", 8, 32, 16, 2)
-gaussian_sigma = st.sidebar.slider("Gaussian Smoothing Sigma", 0.5, 5.0, 3.0, 0.5)
-
-st.sidebar.subheader("3. Adaptive Binarisation")
-adaptive_block = st.sidebar.slider("Adaptive Threshold Block Size", 5, 31, 15, 2)
-adaptive_c = st.sidebar.slider("Constant Subtraction (C)", -5, 10, 3, 1)
-
-st.sidebar.subheader("4. Feature Detection")
-use_yolo = st.sidebar.checkbox("Prefer trained YOLO minutiae model", value=True,
-                                help="Falls back automatically to the classical "
-                                     "crossing-number detector if no trained "
-                                     "weights are found at models/minutiae_yolo.pt")
-st.sidebar.caption(f"YOLO weights found: {'✅ yes' if yolo_model_available() else '❌ no (using classical detector)'}")
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Local database: SQLite (`data/fingerprints.db`)")
-st.sidebar.caption(f"Records stored: {len(database.get_all_records(hydrate=False))}")
-
-
-def run_full_pipeline(raw_matrix: np.ndarray) -> dict:
-    """Runs Modules A -> B -> C end to end and returns every artefact the
-    UI/report/database need."""
-    pipeline = run_acquisition_pipeline(
-        raw_matrix, clip_limit, tile_grid, adaptive_block, adaptive_c,
-        block_size, gaussian_sigma,
+    st.markdown(
+        "Upload real fingerprint images and this tab will **process each one directly** through "
+        "all four of the team's enhancement algorithms — standalone, with no synthetic "
+        "degradation step — and generate the comparison metrics from them. For a full benchmark "
+        "(e.g. a set of 100 fingerprint photos), select every file at once — each image is scored "
+        "individually and the results below are the **average across every uploaded image**, "
+        "per algorithm."
     )
 
-    calib = calibrate_image(pipeline["raw"], pipeline["theta_field"], block_size=24)
+    # ------------------------------------------------------------------ #
+    # Step 1 — upload samples
+    # ------------------------------------------------------------------ #
+    st.subheader("Step 1: Upload Fingerprint Images")
+    uploaded_files = st.file_uploader(
+        "Upload one or more fingerprint images",
+        type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
+        accept_multiple_files=True,
+    )
 
-    singular_points = detect_singular_points(pipeline["theta_field"], block_size=block_size)
+    if uploaded_files:
+        st.caption(f"{len(uploaded_files)} image(s) selected.")
+        if len(uploaded_files) > 150:
+            st.warning(
+                "Large batches (150+ images) can take several minutes to process, since every "
+                "image is run through every selected algorithm."
+            )
 
-    bgr_for_yolo = cv2.cvtColor(pipeline["raw"], cv2.COLOR_GRAY2BGR)
-    minutiae = detect_minutiae(pipeline["binary"], pipeline["theta_field"],
-                                image_bgr=bgr_for_yolo, prefer_yolo=use_yolo)
+    st.info(
+        "Each algorithm enhances every uploaded image exactly as-is — no synthetic blur, noise, "
+        "or degradation is applied, so the results reflect each algorithm's standalone "
+        "enhancement performance on your real data. Confusion Matrix / Accuracy / Precision / "
+        "Recall / F1 are computed against a pseudo ground-truth mask derived independently from "
+        "each image, plus a no-reference Ridge Clarity Score."
+    )
 
-    classification = classify_pattern(singular_points)
+    st.subheader("Step 2: Choose Algorithms")
+    selected_algos = st.multiselect(
+        "Algorithms to include", options=list(ALGORITHMS.keys()), default=list(ALGORITHMS.keys()),
+    )
 
-    minutiae_overlay = draw_minutiae_overlay(pipeline["binary"], minutiae)
-    singular_overlay = pipeline["vector_overlay"].copy()
-    for p in singular_points:
-        colour = (0, 165, 255) if p.kind == "core" else (255, 0, 255)
-        cv2.drawMarker(singular_overlay, (p.x, p.y), colour,
-                        markerType=cv2.MARKER_TILTED_CROSS, markerSize=16, thickness=2)
+    run = st.button("Run Benchmark", type="primary")
 
-    return {
-        **pipeline,
-        "calibration": calib,
-        "singular_points": singular_points,
-        "minutiae": minutiae,
-        "classification": classification,
-        "minutiae_overlay": minutiae_overlay,
-        "singular_overlay": singular_overlay,
-    }
-
-
-def render_pipeline_results(result: dict, key_prefix: str = ""):
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown('<div class="section-header">1. Enhanced Ridge Structure</div>', unsafe_allow_html=True)
-        st.image(result["binary"], use_container_width=True, caption="CLAHE + Adaptive Binarisation")
-    with col2:
-        st.markdown('<div class="section-header">2. Minutiae Detection</div>', unsafe_allow_html=True)
-        st.image(result["minutiae_overlay"], use_container_width=True, channels="BGR",
-                 caption=f"{len(result['minutiae'])} minutiae "
-                         f"({'YOLO' if result['minutiae'] and result['minutiae'][0].source == 'yolo' else 'classical CN'})")
-    with col3:
-        st.markdown('<div class="section-header">3. Singular Points</div>', unsafe_allow_html=True)
-        st.image(result["singular_overlay"], use_container_width=True, channels="BGR",
-                 caption="Orange = core, Magenta = delta")
-
-    st.markdown("---")
-    st.subheader("📊 Analysis Summary")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Pattern Type", result["classification"].pattern_type)
-    m2.metric("Minutiae Count", len(result["minutiae"]))
-    m3.metric("Estimated DPI", f"{result['calibration'].estimated_dpi:.0f}")
-    m4.metric("Cores / Deltas", f"{result['classification'].num_cores} / {result['classification'].num_deltas}")
-    st.info(result["classification"].explanation)
-
-
-# ----------------------------------------------------------------
-# TABS
-# ----------------------------------------------------------------
-tab_single, tab_batch, tab_video, tab_db, tab_dashboard = st.tabs([
-    "🔍 Single Analysis", "📁 Batch Processing", "🎞️ Video Ingestion",
-    "🗄️ Database & Identification", "📈 Analytics Dashboard",
-])
-
-# ================================================================
-# TAB 1 — SINGLE IMAGE ANALYSIS
-# ================================================================
-with tab_single:
-    uploaded_file = st.file_uploader("📤 Upload a fingerprint image", type=["png", "jpg", "jpeg", "tif", "bmp"],
-                                      key="single_upload")
-
-    if uploaded_file is not None:
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        raw_matrix = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
-
-        with st.spinner("Running acquisition → calibration → detection → classification..."):
-            result = run_full_pipeline(raw_matrix)
-
-        st.session_state["last_result"] = result
-        st.session_state["last_raw"] = raw_matrix
-        st.session_state["last_filename"] = uploaded_file.name
-
-        render_pipeline_results(result)
-
-        st.markdown("---")
-        st.subheader("💾 Save to Local Database")
-        c1, c2, c3 = st.columns([2, 2, 1])
-        subject_name = c1.text_input("Subject name", key="save_name")
-        subject_id = c2.text_input("Subject ID (optional)", key="save_id")
-        if c3.button("Save Record", use_container_width=True):
-            if not subject_name:
-                st.warning("Please enter a subject name before saving.")
-            else:
-                os.makedirs(database.IMAGE_DIR, exist_ok=True)
-                image_path = os.path.join(database.IMAGE_DIR,
-                                           f"{subject_name}_{datetime.now():%Y%m%d%H%M%S}.png")
-                cv2.imwrite(image_path, raw_matrix)
-                database.insert_record(
-                    subject_name, subject_id, image_path,
-                    result["classification"].pattern_type, result["minutiae"],
-                    result["singular_points"], result["calibration"].estimated_dpi,
-                )
-                st.success(f"Saved record for '{subject_name}'.")
-
-        st.markdown("---")
-        st.subheader("📄 Export PDF Report")
-        if st.button("Generate Report"):
-            with st.spinner("Building PDF report..."):
-                out_path = os.path.join(tempfile.gettempdir(), f"fingerprint_report_{datetime.now():%Y%m%d%H%M%S}.pdf")
-                generate_report(
-                    out_path, subject_name or "Unnamed", subject_id or "",
-                    result["raw"], result["enhanced"], result["minutiae_overlay"],
-                    result["singular_overlay"], result["classification"],
-                    result["calibration"].estimated_dpi, len(result["minutiae"]),
-                )
-            with open(out_path, "rb") as f:
-                st.download_button("⬇️ Download Report PDF", f, file_name="fingerprint_report.pdf",
-                                    mime="application/pdf")
-    else:
-        st.info("Upload a fingerprint image to begin the 3-stage analysis pipeline "
-                "(enhancement → feature detection → classification).")
-
-# ================================================================
-# TAB 2 — BATCH PROCESSING (Extra Effort: bulk ingestion)
-# ================================================================
-with tab_batch:
-    st.write("Upload multiple fingerprint images at once for bulk processing "
-             "(Extra Effort: bulk/folder-style ingestion).")
-    batch_files = st.file_uploader("📤 Upload multiple images", type=["png", "jpg", "jpeg", "tif", "bmp"],
-                                    accept_multiple_files=True, key="batch_upload")
-
-    if batch_files:
-        if st.button(f"Process {len(batch_files)} images"):
-            progress = st.progress(0.0)
-            summary_rows = []
-            for i, f in enumerate(batch_files):
-                file_bytes = np.asarray(bytearray(f.read()), dtype=np.uint8)
-                raw = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
-                if raw is None:
-                    continue
-                res = run_full_pipeline(raw)
-                summary_rows.append({
-                    "File": f.name,
-                    "Pattern": res["classification"].pattern_type,
-                    "Minutiae": len(res["minutiae"]),
-                    "Cores": res["classification"].num_cores,
-                    "Deltas": res["classification"].num_deltas,
-                    "Est. DPI": round(res["calibration"].estimated_dpi, 1),
-                })
-                progress.progress((i + 1) / len(batch_files))
-
-            st.session_state["batch_summary"] = summary_rows
-            st.success(f"Processed {len(summary_rows)} images.")
-
-    if "batch_summary" in st.session_state:
-        st.dataframe(st.session_state["batch_summary"], use_container_width=True)
-
-# ================================================================
-# TAB 3 — VIDEO INGESTION (Extra Effort: video stream processing)
-# ================================================================
-with tab_video:
-    st.write("Upload a short video (e.g. a fingerprint card being scanned frame-by-frame) "
-             "and run the pipeline on any extracted frame (Extra Effort: video-stream ingestion).")
-    video_file = st.file_uploader("📤 Upload video", type=["mp4", "avi", "mov"], key="video_upload")
-
-    if video_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-            tmp.write(video_file.read())
-            tmp_path = tmp.name
-
-        cap = cv2.VideoCapture(tmp_path)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        st.caption(f"Video contains {frame_count} frames.")
-
-        frame_idx = st.slider("Select frame to analyse", 0, max(frame_count - 1, 0), 0)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
-        cap.release()
-
-        if ok:
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            st.image(gray_frame, caption=f"Frame {frame_idx}", use_container_width=True, clamp=True)
-
-            if st.button("Analyse this frame"):
-                with st.spinner("Running pipeline on selected frame..."):
-                    result = run_full_pipeline(gray_frame)
-                render_pipeline_results(result, key_prefix="video")
+    # ------------------------------------------------------------------ #
+    # Build sample list + run
+    # ------------------------------------------------------------------ #
+    if run:
+        if not selected_algos:
+            st.warning("Select at least one algorithm.")
+        elif not uploaded_files:
+            st.warning("Please upload at least one fingerprint image.")
         else:
-            st.error("Could not read the selected frame.")
+            samples = []
+            for f in uploaded_files:
+                pil_img = Image.open(f).convert("L")
+                arr = load_and_resize(np.array(pil_img), max_dim=300)
+                gt_mask = derive_pseudo_ground_truth_mask(arr)
+                samples.append({"image": arr, "gt_mask": gt_mask, "label": f.name})
 
-        os.unlink(tmp_path)
+            progress = st.progress(0, text="Running benchmark...")
+            per_algo_records = {name: [] for name in selected_algos}
+            total_steps = len(samples) * len(selected_algos)
+            step = 0
 
-# ================================================================
-# TAB 4 — DATABASE & IDENTIFICATION
-# ================================================================
-with tab_db:
-    st.subheader("🗄️ Stored Records")
-    records = database.get_all_records()
+            for sample in samples:
+                sample["enhanced"] = {}
+                sample["metrics"] = {}
+                for name in selected_algos:
+                    fn = ALGORITHMS[name]
+                    t0 = time.perf_counter()
+                    enhanced, aux = fn(sample["image"])
+                    dt = time.perf_counter() - t0
 
-    if records:
-        table_view = [{
-            "ID": r["id"], "Subject": r["subject_name"], "Pattern": r["pattern_type"],
-            "Minutiae": r["num_minutiae"], "Cores": r["num_cores"], "Deltas": r["num_deltas"],
-            "Est. DPI": round(r["estimated_dpi"], 1) if r["estimated_dpi"] else None,
-            "Saved": r["created_at"],
-        } for r in records]
-        st.dataframe(table_view, use_container_width=True)
+                    pred_mask = binarize_otsu(enhanced)
+                    cls = compute_classification_metrics(sample["gt_mask"], pred_mask)
+                    rec = {**cls, "time": dt, "clarity": ridge_clarity_score(enhanced)}
 
-        del_col1, del_col2 = st.columns([3, 1])
-        del_id = del_col1.number_input("Record ID to delete", min_value=0, step=1)
-        if del_col2.button("Delete Record"):
-            database.delete_record(int(del_id))
-            st.rerun()
-    else:
-        st.info("No records saved yet. Save records from the Single Analysis tab.")
+                    per_algo_records[name].append(rec)
+                    sample["enhanced"][name] = enhanced
+                    sample["metrics"][name] = rec
 
-    st.markdown("---")
-    st.subheader("🔎 Identify a Fingerprint Against the Database")
-    query_file = st.file_uploader("📤 Upload a query fingerprint", type=["png", "jpg", "jpeg", "tif", "bmp"],
-                                   key="query_upload")
+                    step += 1
+                    progress.progress(step / total_steps, text=f"{sample['label']} — {name.split(':')[0]}")
 
-    if query_file is not None and records:
-        file_bytes = np.asarray(bytearray(query_file.read()), dtype=np.uint8)
-        query_raw = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+            progress.empty()
 
-        if st.button("Run Identification"):
-            with st.spinner("Extracting features and comparing against all stored records..."):
-                query_result = run_full_pipeline(query_raw)
-                match_results = identify(query_result["minutiae"], query_result["singular_points"], records)
+            # Aggregate (mean) across every uploaded image; keys are consistent within a run
+            results = {}
+            for name in selected_algos:
+                recs = per_algo_records[name]
+                keys = [k for k in recs[0].keys() if k != "confusion_matrix"]
+                agg = {k: float(np.mean([r[k] for r in recs])) for k in keys}
+                agg["confusion_matrix"] = sum(r["confusion_matrix"] for r in recs)
+                results[name] = agg
 
-            st.session_state["last_query_result"] = query_result
-            st.session_state["last_match_results"] = match_results
+            best_algo = max(results, key=lambda k: results[k]["f1"])
 
-            render_pipeline_results(query_result, key_prefix="query")
+            st.session_state["benchmark_results"] = results
+            st.session_state["benchmark_best_algo"] = best_algo
+            st.session_state["benchmark_samples"] = samples
+            label_preview = ", ".join(s["label"] for s in samples[:5])
+            if len(samples) > 5:
+                label_preview += f", … (+{len(samples) - 5} more)"
+            st.session_state["benchmark_params"] = {
+                "Sample source": "Uploaded real image(s)",
+                "Evaluation mode": "Direct — each algorithm enhances the uploaded image as-is "
+                                    "(no synthetic degradation)",
+                "Images benchmarked": len(samples),
+                "Sample labels": label_preview,
+                "Algorithms tested": ", ".join(a.split(":")[0] for a in selected_algos),
+            }
+            st.success(
+                f"Benchmark complete over {len(samples)} image(s). "
+                f"Best algorithm by average F1-score: **{best_algo}**"
+            )
 
-            st.markdown("### Ranked Matches")
-            match_table = [{
-                "Rank": i + 1, "Subject": m.subject_name, "Score": round(m.score, 3),
-                "Matched Pairs": m.matched_pairs, "Decision": "✅ MATCH" if m.is_match else "no match",
-            } for i, m in enumerate(match_results[:10])]
-            st.dataframe(match_table, use_container_width=True)
+    # ------------------------------------------------------------------ #
+    # Render results (persists across reruns)
+    # ------------------------------------------------------------------ #
+    if "benchmark_results" in st.session_state:
+        results = st.session_state["benchmark_results"]
+        best_algo = st.session_state["benchmark_best_algo"]
+        samples = st.session_state["benchmark_samples"]
+        params = st.session_state["benchmark_params"]
+        short_names = [n.split(":")[0] for n in results]
 
-            if match_results and match_results[0].is_match:
-                st.success(f"Best match: **{match_results[0].subject_name}** "
-                           f"(score {match_results[0].score:.3f})")
-            else:
-                st.warning("No confident match found in the database (all scores below threshold).")
-    elif query_file is not None and not records:
-        st.warning("No records in the database yet — save some fingerprints first.")
+        st.divider()
+        st.subheader("Metric Summary")
+        st.markdown(
+            f"**Best performing algorithm — highest average F1 across {len(samples)} image(s): "
+            f"`{best_algo}`**"
+        )
 
-# ================================================================
-# TAB 5 — ANALYTICS DASHBOARD
-# ================================================================
-with tab_dashboard:
-    st.subheader("📈 Database Analytics")
-    records = database.get_all_records(hydrate=False)
+        table_rows_display = []
+        for name, res in results.items():
+            table_rows_display.append({
+                "Algorithm": name,
+                "Accuracy": f"{res['accuracy']:.3f}",
+                "Precision": f"{res['precision']:.3f}",
+                "Recall": f"{res['recall']:.3f}",
+                "F1-score": f"{res['f1']:.3f}",
+                "Clarity Score": f"{res['clarity']:.3f}",
+                "Avg time (s)": f"{res['time']:.3f}",
+            })
+        st.dataframe(table_rows_display, use_container_width=True, hide_index=True)
 
-    if not records:
-        st.info("No data yet — process and save fingerprints to populate the dashboard.")
-    else:
-        total = len(records)
-        avg_minutiae = np.mean([r["num_minutiae"] for r in records])
-        avg_dpi = np.mean([r["estimated_dpi"] for r in records if r["estimated_dpi"]])
+        # Per-image breakdown — shows exactly how the average above was derived
+        # across every uploaded image (useful appendix data for a report).
+        with st.expander(f"Per-image metric breakdown ({len(samples)} images × {len(results)} algorithms)"):
+            rows = []
+            for s in samples:
+                for name, rec in s["metrics"].items():
+                    rows.append({
+                        "Image": s["label"], "Algorithm": name.split(":")[0],
+                        "Accuracy": round(rec["accuracy"], 3), "Precision": round(rec["precision"], 3),
+                        "Recall": round(rec["recall"], 3), "F1": round(rec["f1"], 3),
+                        "Clarity": round(rec["clarity"], 3), "Time (s)": round(rec["time"], 3),
+                    })
+            breakdown_df = pd.DataFrame(rows)
+            st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+            csv_bytes = breakdown_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download per-image results (CSV)",
+                data=csv_bytes,
+                file_name="per_image_results.csv",
+                mime="text/csv",
+            )
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total Records", total)
-        m2.metric("Avg. Minutiae / Print", f"{avg_minutiae:.1f}")
-        m3.metric("Avg. Estimated DPI", f"{avg_dpi:.0f}")
+        # ------------------------------------------------------------------ #
+        # Confusion matrices — native dataframe (styled) per algorithm
+        # ------------------------------------------------------------------ #
+        st.subheader("Confusion Matrices")
+        st.caption(f"Ridge (1) vs Valley (0) pixel classification, summed across all {len(samples)} image(s)")
+        cm_cols = st.columns(len(results))
+        for col, (name, res) in zip(cm_cols, results.items()):
+            with col:
+                st.caption(name.split(":")[0])
+                cm_df = pd.DataFrame(
+                    res["confusion_matrix"],
+                    index=["Actual: Valley (0)", "Actual: Ridge (1)"],
+                    columns=["Pred: Valley (0)", "Pred: Ridge (1)"],
+                )
+                st.dataframe(
+                    cm_df.style.background_gradient(cmap="Blues").format("{:.0f}"),
+                    use_container_width=True,
+                )
 
-        st.markdown("#### Pattern Type Distribution")
-        distribution = database.pattern_type_distribution()
-        st.bar_chart(distribution)
+        # ------------------------------------------------------------------ #
+        # Classification metrics — native grouped bar chart
+        # ------------------------------------------------------------------ #
+        st.subheader("Classification Metrics")
+        metric_cols = ["accuracy", "precision", "recall", "f1"]
+        metric_df = pd.DataFrame(
+            {m.capitalize(): [results[n][m] for n in results] for m in metric_cols},
+            index=short_names,
+        )
+        st.bar_chart(metric_df, stack=False)
 
-        st.markdown("#### All Records")
-        st.dataframe(records, use_container_width=True)
+        # ------------------------------------------------------------------ #
+        # Ridge clarity — native bar chart
+        # ------------------------------------------------------------------ #
+        st.subheader("Ridge Clarity")
+        st.caption("No-reference ridge-orientation clarity score (0–1, higher = better)")
+        clarity_df = pd.DataFrame({"Clarity": [results[n]["clarity"] for n in results]}, index=short_names)
+        st.bar_chart(clarity_df)
+
+        # Sample picker for gallery / histograms
+        sample_labels = [s["label"] for s in samples]
+        chosen_label = st.selectbox("View gallery / histogram for image:", sample_labels)
+        chosen = next(s for s in samples if s["label"] == chosen_label)
+
+        st.subheader(f"Sample Gallery — {chosen_label}")
+        gallery_fig = plot_sample_gallery(chosen["image"], chosen["enhanced"], IMAGE_LABEL)
+        st.pyplot(gallery_fig)
+
+        st.subheader("Intensity Histograms")
+        st.caption(f"Pixel intensity distribution for {chosen_label}")
+        hist_sources = {IMAGE_LABEL: chosen["image"],
+                         **{n.split(":")[0]: im for n, im in chosen["enhanced"].items()}}
+        bins = np.linspace(0, 255, 33)
+        bin_centers = ((bins[:-1] + bins[1:]) / 2).astype(int)
+        hist_df = pd.DataFrame(
+            {label: np.histogram(img, bins=bins)[0] for label, img in hist_sources.items()},
+            index=bin_centers,
+        )
+        st.bar_chart(hist_df)
+
+        st.divider()
+        st.subheader("Export Report")
+        if st.button("Generate PDF Report"):
+            with st.spinner("Building PDF..."):
+                header = ["Algorithm", "Accuracy", "Precision", "Recall", "F1", "Clarity", "Time (s)"]
+                rows = [[n.split(":")[0], f"{r['accuracy']:.3f}", f"{r['precision']:.3f}",
+                         f"{r['recall']:.3f}", f"{r['f1']:.3f}", f"{r['clarity']:.3f}",
+                         f"{r['time']:.3f}"] for n, r in results.items()]
+                note = (
+                    "Every algorithm was benchmarked standalone: each uploaded image was enhanced "
+                    "as-is, with no synthetic degradation step. Output was scored against a pseudo "
+                    "ground-truth ridge mask derived directly from the same image, plus a "
+                    "no-reference ridge-orientation clarity score, then averaged across all "
+                    "uploaded images."
+                )
+                # Rebuilt here as static matplotlib images (rather than the interactive Streamlit
+                # components shown on screen) purely because the PDF export needs embeddable
+                # figures — ReportLab can't embed a live Streamlit widget.
+                cm_fig_pdf = plot_confusion_matrices(results)
+                bar_fig_pdf = plot_metric_bars(results)
+                clarity_fig_pdf = plot_clarity_bars(results)
+                hist_images = {IMAGE_LABEL: chosen["image"], **chosen["enhanced"]}
+                hist_fig_pdf = plot_histograms(hist_images)
+                figures = {
+                    "gallery": gallery_fig, "confusion": cm_fig_pdf, "metric_bars": bar_fig_pdf,
+                    "quality_bars": clarity_fig_pdf, "histograms": hist_fig_pdf,
+                }
+                pdf_buf = build_pdf_report(header, rows, best_algo, figures, params, note)
+                st.session_state["pdf_bytes"] = pdf_buf.getvalue()
+
+        if "pdf_bytes" in st.session_state:
+            st.download_button(
+                "Download PDF Report",
+                data=st.session_state["pdf_bytes"],
+                file_name="fingerprint_algorithm_comparison_report.pdf",
+                mime="application/pdf",
+            )
+
+
+# =============================================================================
+# TAB 2 — REAL APPLICATION (COMING SOON)
+# =============================================================================
+with tab_app:
+    st.subheader("Fingerprint Matching for Graduation Verification")
+    st.info("Coming Soon — this module is under active development.")
+
+    st.markdown(
+        """
+        This tab will host the full end-to-end application described in the assignment brief:
+
+        1. **Import** a (possibly blurred / distorted) fingerprint image.
+        2. **Enhance** it automatically using the best-performing algorithm identified in the
+           *Algorithm Comparison* tab.
+        3. **Match** the enhanced fingerprint against a student database.
+        4. **Display** the matched student's record:
+           - Name
+           - Gender
+           - Course
+           - Grade level
+           - Status (**Graduated** / **Failed**)
+
+        ---
+        **Planned architecture**
+        - Enrolment step: store a reference (enhanced) fingerprint template + student record per
+          student.
+        - Matching step: minutiae or correlation-based matching between the query fingerprint and
+          every enrolled template, returning the closest match above a similarity threshold.
+        - Results dashboard: matched photo/template side-by-side with the student record and a
+          confidence score.
+
+        Check back once the team finalises the matching module and student database schema.
+        """
+    )
+    st.button("Notify me when this is ready", disabled=True)
