@@ -1,11 +1,34 @@
 # Student Attendance Fingerprint System
 
 A local Streamlit prototype for fingerprint-based classroom attendance. Its
-production enhancement engine follows the binarization-based filtering method
-described by Greenberg, Aladjem, Kogan and Dimitrov, while fingerprint identity
-matching remains a separate downstream operation.
+production enhancement engine uses CLAHE, edge-preserving bilateral filtering
+and mild unsharp enhancement, while identity matching remains separate.
 
 ## Run the application
+
+### Easy start and stop
+
+Double-click `START_APP.bat` to start the server and open the app. Double-click
+`STOP_APP.bat` when finished. From PowerShell, the same shortcuts are:
+
+```powershell
+.\START_APP.bat
+.\STOP_APP.bat
+```
+
+The server runs quietly in the background. Diagnostic output is available in
+`data/streamlit-output.log` and `data/streamlit-error.log` if needed. Running
+`START_APP.bat` again detects the existing managed server instead of creating a
+duplicate process. `STOP_APP.bat` stops the Python listener on this project's
+reserved port even if the app was originally started manually. Closing the
+browser tab is optional and does not stop the server.
+
+The included Streamlit configuration binds the app to `127.0.0.1`, so it is
+available only on the current computer by default. `.gitignore` excludes the
+SQLite database, student information, fingerprint references/templates and
+runtime logs; do not force-add those sensitive files to GitHub.
+
+### Manual method
 
 Install the packages once:
 
@@ -19,30 +42,53 @@ Then start the system with the requested command:
 python -m streamlit run app.py
 ```
 
+When started manually, stop it in the same terminal by pressing `Ctrl+C` once.
+
 If `python` is not available in a new PowerShell window, activate the included
 environment first with `.\.venv\Scripts\Activate.ps1`. Streamlit normally opens
 `http://localhost:8501` automatically.
 
+### Run on macOS
+
+After cloning the project on a Mac, create a local environment and start it with:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+python3 -m streamlit run app.py
+```
+
+Stop it with `Control+C`. Runtime databases, biometric images, logs and backups
+remain ignored by Git and are created locally on each computer.
+
+For a sharper live capture, a compatible iPhone can appear to macOS as a webcam
+through Continuity Camera. It works wirelessly or over USB. Connect and trust the
+Mac, enable Continuity Camera under **iPhone Settings > General > AirPlay &
+Continuity**, then select the iPhone in the browser's camera settings before
+opening **Live camera capture**. The app receives the resulting camera frame in
+the same format as any other webcam; no fingerprint-processing code change is
+required.
+
 ## Implemented filtering technique
 
-The same five filtering stages are executed for every capture:
+Foreground extraction is always executed first, followed by the same six
+filtering stages for every capture:
 
-1. Local histogram equalization using an `11 x 11` neighbourhood.
-2. Pixel-wise adaptive Wiener noise filtering using a `3 x 3` neighbourhood.
-3. Adaptive binarization against the `13 x 13` local intensity mean.
-4. Morphological thinning of black ridges to one-pixel centre lines.
-5. Binary ridge post-processing that removes connected false ridges shorter
+0. Centre-colour, boundary and ridge-coherence segmentation crops and normalizes
+   the fingerprint pad while whitening its background.
+
+1. CLAHE local contrast enhancement using an `8 x 8` tile grid and clip limit `2.0`.
+2. Edge-preserving bilateral filtering using a `5 x 5` neighbourhood.
+3. Mild unsharp enhancement that reinforces ridge edges already present.
+4. Adaptive binarization against the `13 x 13` local intensity mean.
+5. Morphological thinning of black ridges to one-pixel centre lines.
+6. Binary ridge post-processing that removes connected false ridges shorter
    than 10 pixels and closes small gaps.
 
-A variance-based foreground guard excludes blank background and scanner frames
-before the five stages. This is clearly labelled as a system extension rather
-than a stage claimed by the paper. Resizing and padding only create a consistent
-array for local database comparison.
-
-The application no longer presents STFT, orientation estimation, ridge-frequency
-calculation or Gabor filtering as its production enhancement path. Any values in
-the earlier Assignment IP benchmark are historical report values and must not be
-described as newly measured performance.
+A centre-seeded GrabCut mask combines colour and object boundaries to isolate the
+fingertip from a phone-photo background. The detected pad is cropped and scaled
+consistently before filtering and matching.
 
 ## Attendance identification flow
 
@@ -65,20 +111,21 @@ forensic or high-security biometric certification.
 
 - Student enrolment with one to three captures of the same finger
 - One-to-many local fingerprint identification
+- Browser camera capture with automatic post-capture attendance verification
 - Capture-quality, match-threshold and ambiguity guards
 - Present/late classification and duplicate prevention
 - SQLite persistence for students, templates, sessions and attendance
 - Dashboard, class roster and audit information
 - CSV and polished PDF attendance-register exports
 - Labelled synthetic demo cohort for end-to-end demonstrations
-- Algorithm Studio with all five live intermediate filtering results
+- Algorithm Studio with all six live intermediate filtering results
 
 ## Project modules
 
 | File | Responsibility |
 |---|---|
 | `app.py` | Streamlit navigation and application workflows |
-| `fingerprint_processing.py` | Paper-aligned filtering, quality measurements and comparison helpers |
+| `fingerprint_processing.py` | Ridge-preserving enhancement, quality measurements and comparison helpers |
 | `matching.py` | One-to-many identification and attendance-status logic |
 | `database.py` | SQLite schema and persistence operations |
 | `reporting.py` | PDF attendance-register generator |
@@ -97,6 +144,11 @@ forensic or high-security biometric certification.
 Synthetic demo records are marked `(Demo)` and must not be reported as real
 experimental measurements.
 
+For a physical capture, choose **Live camera capture**, allow browser camera
+permission and take a still image. The new capture is processed and matched
+automatically. This is convenient acquisition, not continuous-video liveness or
+anti-spoofing.
+
 ## Data and privacy
 
 Runtime data is stored under `data/` and excluded from Git by default. New
@@ -108,12 +160,13 @@ through the enhanced-image fallback.
 Fingerprints are sensitive personal data. Real deployment requires informed
 consent, access control, encryption at rest and a documented retention policy.
 
-## Source
+## Sources
 
-Greenberg, S., Aladjem, M., Kogan, D., & Dimitrov, I. (2000). *Fingerprint image
-enhancement using filtering techniques*. Proceedings of the 15th International
-Conference on Pattern Recognition. The extended journal article is available at
-https://doi.org/10.1006/rtim.2001.0283.
+The implementation uses the documented OpenCV CLAHE and bilateral-filtering
+operations. See `FILTERING_METHODOLOGY.md` for the rationale, parameters,
+limitations and evaluation design. STFT remains documented there as a rejected
+experiment for these phone captures because it generated unsupported coarse
+ridge patterns.
 
 AI assistance used to produce or refine a submission should be declared in the
 assignment's AI Usage Disclosure Form.

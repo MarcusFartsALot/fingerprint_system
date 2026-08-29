@@ -274,8 +274,8 @@ def build_attendance_pdf(session: dict[str, Any], roster: list[dict[str, Any]]) 
                 [
                     Paragraph("Verification method", styles["eyebrow"]),
                     Paragraph(
-                        "Captures were processed locally using 11 x 11 local histogram equalization, "
-                        "3 x 3 adaptive Wiener filtering, 13 x 13 local-mean binarization, "
+                        "Captures were processed locally using clipped local histogram enhancement (CLAHE), "
+                        "5 x 5 bilateral edge-preserving denoising, mild unsharp enhancement, 13 x 13 local-mean binarization, "
                         "morphological thinning and binary ridge post-processing. "
                         "A variance-based foreground guard rejects scanner borders as a system extension. "
                         "Identity matching is a separate downstream function that compares canonical "

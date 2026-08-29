@@ -122,6 +122,45 @@ def initialise_database(database_path: str | Path = DATABASE_PATH) -> None:
             database.execute(
                 "ALTER TABLE fingerprint_templates ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}'"
             )
+        _repair_moved_template_paths(database)
+
+
+def _repair_moved_template_paths(database: sqlite3.Connection) -> int:
+    """Rebase absolute biometric paths after the project is moved or copied.
+
+    Older databases stored paths from the computer where they were created.
+    The files themselves live inside this project's data folders, so matching
+    by the safe basename restores portability without deleting any records.
+    """
+
+    repaired = 0
+    rows = database.execute(
+        "SELECT template_id, image_path, reference_path FROM fingerprint_templates"
+    ).fetchall()
+    for row in rows:
+        updates: dict[str, str] = {}
+        image_path = Path(str(row["image_path"]))
+        if not image_path.is_file():
+            candidate = TEMPLATE_DIR / image_path.name
+            if candidate.is_file():
+                updates["image_path"] = str(candidate.resolve())
+
+        if row["reference_path"]:
+            reference_path = Path(str(row["reference_path"]))
+            if not reference_path.is_file():
+                candidate = REFERENCE_DIR / reference_path.name
+                if candidate.is_file():
+                    updates["reference_path"] = str(candidate.resolve())
+
+        if not updates:
+            continue
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        database.execute(
+            f"UPDATE fingerprint_templates SET {assignments} WHERE template_id = ?",
+            (*updates.values(), int(row["template_id"])),
+        )
+        repaired += 1
+    return repaired
 
 
 def _rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:

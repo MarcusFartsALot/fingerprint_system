@@ -55,8 +55,9 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(self.first.binary.shape, (360, 360))
         self.assertEqual(self.first.thinned.shape, (360, 360))
         self.assertEqual(self.first.skeleton.shape, (360, 360))
-        self.assertEqual(self.first.local_equalised.shape, (360, 360))
-        self.assertEqual(self.first.wiener_filtered.shape, (360, 360))
+        self.assertEqual(self.first.contrast_enhanced.shape, (360, 360))
+        self.assertEqual(self.first.denoised.shape, (360, 360))
+        self.assertEqual(self.first.detail_enhanced.shape, (360, 360))
         self.assertEqual(self.first.region_mask.shape, (360, 360))
         self.assertTrue(set(np.unique(self.first.region_mask)).issubset({0, 255}))
         outside_mask = self.first.region_mask == 0
@@ -69,8 +70,9 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(
             self.first.stages,
             [
-                "Local histogram equalization (11 x 11)",
-                "Adaptive Wiener filtering (3 x 3)",
+                "CLAHE local contrast enhancement (clip limit 2.0)",
+                "Bilateral edge-preserving denoising (5 x 5)",
+                "Mild unsharp ridge enhancement (sigma 0.8)",
                 "Adaptive local-mean binarization (13 x 13)",
                 "Morphological thinning",
                 "Binary ridge post-processing",
@@ -109,7 +111,7 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(blurred.stages, self.first.stages)
         self.assertEqual(noisy.stages, self.first.stages)
         self.assertEqual(low_contrast.stages, self.first.stages)
-        self.assertFalse(np.array_equal(blurred.local_equalised, blurred.enhanced))
+        self.assertFalse(np.array_equal(blurred.contrast_enhanced, blurred.enhanced))
 
     def test_genuine_query_ranks_correct_student(self) -> None:
         matrix = cv2.getRotationMatrix2D((170, 170), 2.0, 1.0)

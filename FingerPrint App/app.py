@@ -1,4 +1,4 @@
-"""Paper-aligned student attendance fingerprint system.
+"""Ridge-preserving student attendance fingerprint system.
 
 Run from this directory with:
     python -m streamlit run app.py
@@ -10,6 +10,7 @@ import importlib
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
 
@@ -19,6 +20,7 @@ import pandas as pd
 import streamlit as st
 
 import fingerprint_processing as fingerprint_module
+import matching as matching_module
 
 from database import (
     DATA_DIR,
@@ -44,12 +46,15 @@ from database import (
 )
 # Streamlit can retain an older imported module while hot-reloading this file.
 # Reload only when the processing module's public interface has changed.
-_REQUIRED_PIPELINE_SCHEMA_VERSION = "greenberg-filtering-v4"
+_REQUIRED_PIPELINE_SCHEMA_VERSION = "phone-ridge-preserving-v10"
 _PROCESSING_EXPORTS = (
     "PIPELINE_SCHEMA_VERSION",
     "PipelineResult",
     "generate_demo_fingerprint",
     "process_fingerprint",
+    "clahe_contrast_enhancement",
+    "bilateral_ridge_denoising",
+    "mild_unsharp_ridge_enhancement",
 )
 _processing_module_reloaded = False
 if (
@@ -63,11 +68,18 @@ if (
 PipelineResult = fingerprint_module.PipelineResult
 generate_demo_fingerprint = fingerprint_module.generate_demo_fingerprint
 process_fingerprint = fingerprint_module.process_fingerprint
+if (
+    _processing_module_reloaded
+    or getattr(matching_module, "MATCHING_PIPELINE_SCHEMA_VERSION", None)
+    != fingerprint_module.PIPELINE_SCHEMA_VERSION
+):
+    matching_module = importlib.reload(matching_module)
 from matching import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MATCH_THRESHOLD,
     IdentificationResult,
     attendance_status,
+    capture_quality_issue,
     identify_student,
     save_enhanced_template,
     save_reference_capture,
@@ -147,6 +159,7 @@ def pipeline_payload(result: PipelineResult) -> dict:
     """Return the JSON-safe enhancement record stored with an enrolment."""
 
     return {
+        "schema_version": fingerprint_module.PIPELINE_SCHEMA_VERSION,
         "stages": result.stages,
         "quality": result.quality,
     }
@@ -233,7 +246,7 @@ def load_demo_cohort() -> tuple[int, int, int]:
                 "reference_path": str(reference_path.resolve()),
                 "quality": result.quality["overall"],
                 "clarity": result.quality["clarity"],
-                "minutiae_count": 0,
+                "minutiae_count": int(result.quality.get("minutiae_count", 0)),
                 "profile": pipeline_payload(result),
             }
 
@@ -361,7 +374,7 @@ def render_scan_result(payload: dict) -> None:
     metrics = st.columns(4)
     similarity = identification.evidence.similarity if identification.evidence else 0.0
     with metrics[0]:
-        st.metric("Match confidence", f"{similarity:.1%}")
+        st.metric("Match score", f"{similarity:.1%}")
     with metrics[1]:
         st.metric("Capture quality", f"{result.quality['overall']:.1%}", quality_label(result.quality["overall"]))
     with metrics[2]:
@@ -369,48 +382,136 @@ def render_scan_result(payload: dict) -> None:
     with metrics[3]:
         st.metric("Processing", f"{payload['elapsed_ms']:.0f} ms", f"{identification.candidates_checked} templates")
 
-    image_columns = st.columns(3)
-    with image_columns[0]:
-        st.image(result.prepared, caption="Original input", width="stretch", clamp=True)
-    with image_columns[1]:
-        st.image(result.wiener_filtered, caption="2. Adaptive Wiener filtering", width="stretch", clamp=True)
-    with image_columns[2]:
-        st.image(result.enhanced, caption="5. Enhanced binary fingerprint", width="stretch", clamp=True)
+    st.subheader("Fingerprint identity comparison")
+    reference_path = identification.reference_path or identification.template_path
+    reference_image = (
+        cv2.imread(str(reference_path), cv2.IMREAD_GRAYSCALE)
+        if reference_path
+        else None
+    )
+    comparison_columns = st.columns(2, gap="large")
+    with comparison_columns[0]:
+        st.image(
+            result.prepared,
+            caption="Current attendance capture — uploaded for this scan",
+            width="stretch",
+            clamp=True,
+        )
+    with comparison_columns[1]:
+        if reference_image is not None:
+            reference_caption = (
+                "Matched database enrolment — verified reference"
+                if identification.matched
+                else "Closest database reference — not accepted"
+            )
+            st.image(reference_image, caption=reference_caption, width="stretch", clamp=True)
+        else:
+            st.info("No database fingerprint reached the comparison stage.")
+
+    if identification.matched and identification.student:
+        student = identification.student
+        identity_columns = st.columns(4)
+        identity_columns[0].metric("Registered student", str(student.get("full_name", "-")))
+        identity_columns[1].metric("Student ID", str(student.get("student_id", "-")))
+        identity_columns[2].metric("Enrolled finger", str(student.get("finger_label", "-")))
+        identity_columns[3].metric(
+            "Programme / group",
+            str(student.get("tutorial_group", "-")),
+            str(student.get("programme", "-")),
+        )
+        inliers = identification.evidence.reference_inliers if identification.evidence else 0
+        st.success(
+            f"The current capture was linked to {student.get('full_name', 'this student')} "
+            f"using {inliers} geometrically consistent local fingerprint features."
+        )
+    elif reference_image is not None:
+        st.warning(
+            "The right image is only the closest database candidate. Its identity was not accepted, "
+            "so no student metadata or attendance record was assigned."
+        )
 
     with st.expander("Technical decision evidence"):
-        st.caption(f"Executed enhancement: {' -> '.join(result.stages)}.")
         if identification.evidence:
             evidence = identification.evidence
-            evidence_columns = st.columns(5)
-            evidence_columns[0].metric(
-                "Reference geometry",
-                f"{evidence.reference_score:.1%}",
-                f"{evidence.reference_inliers}/{evidence.reference_matches} SIFT inliers",
+            st.markdown("#### Biometric feature comparison")
+            st.caption(
+                "These are fingerprint features derived from the image—not filename, EXIF or other file metadata. "
+                "The filters prepare the ridges; the matcher then compares local descriptors and ridge structure."
             )
-            evidence_columns[1].metric(
-                "ORB geometry",
-                f"{evidence.orb_score:.1%}",
-                f"{evidence.geometric_inliers}/{evidence.good_matches} inlier pairs",
+            feature_comparison = pd.DataFrame(
+                [
+                    {
+                        "Evidence": "SIFT local ridge features",
+                        "Current capture": f"{evidence.keypoints_query:,} keypoints",
+                        "Enrolled reference": f"{evidence.keypoints_template:,} keypoints",
+                        "Comparison": f"{evidence.reference_matches} mutual pairs",
+                        "Result": f"{evidence.reference_inliers} RANSAC inliers",
+                    },
+                    {
+                        "Evidence": "Reference geometry",
+                        "Current capture": "Local descriptors",
+                        "Enrolled reference": "Local descriptors",
+                        "Comparison": "Translation / rotation / scale consistency",
+                        "Result": f"{evidence.reference_score:.1%}",
+                    },
+                    {
+                        "Evidence": "Enhanced ORB geometry",
+                        "Current capture": "Filtered binary ridges",
+                        "Enrolled reference": "Stored enhanced template",
+                        "Comparison": f"{evidence.good_matches} candidate pairs",
+                        "Result": f"{evidence.orb_score:.1%} ({evidence.geometric_inliers} inliers)",
+                    },
+                    {
+                        "Evidence": "Aligned ridge structure",
+                        "Current capture": "Ridge direction field",
+                        "Enrolled reference": "Ridge direction field",
+                        "Comparison": "Aligned flow agreement",
+                        "Result": f"{evidence.structural_score:.1%}",
+                    },
+                    {
+                        "Evidence": "Local ridge spectrum",
+                        "Current capture": "Frequency descriptor",
+                        "Enrolled reference": "Frequency descriptor",
+                        "Comparison": "Spectral similarity",
+                        "Result": f"{evidence.spectral_score:.1%}",
+                    },
+                ]
             )
-            evidence_columns[2].metric("Structural", f"{evidence.structural_score:.1%}", "Aligned ridge flow")
-            evidence_columns[3].metric("Spectral", f"{evidence.spectral_score:.1%}", "Local ridge spectrum")
-            evidence_columns[4].metric("Runner-up", f"{identification.runner_up_similarity:.1%}", "Ambiguity guard")
+            st.dataframe(feature_comparison, width="stretch", hide_index=True)
+
+            threshold_used = float(payload.get("threshold", DEFAULT_MATCH_THRESHOLD))
+            ambiguity_used = float(payload.get("ambiguity_margin", DEFAULT_AMBIGUITY_MARGIN))
+            lead = max(similarity - identification.runner_up_similarity, 0.0)
+            decision_columns = st.columns(4)
+            decision_columns[0].metric("Fused match score", f"{similarity:.1%}")
+            decision_columns[1].metric("Required score", f"{threshold_used:.1%}")
+            decision_columns[2].metric("Lead over runner-up", f"{lead:.1%}")
+            decision_columns[3].metric("Required lead", f"{ambiguity_used:.1%}")
+            st.caption(
+                "Score fusion: 54% reference geometry + 18% enhanced ORB geometry + "
+                "20% aligned ridge structure + 8% local ridge spectrum."
+            )
             reference_mode = "canonical enrolment upload" if evidence.used_canonical_reference else "legacy enhanced-template fallback"
             st.caption(f"Primary comparison source: {reference_mode}.")
-        diagnostic_columns = st.columns(5)
+
+        st.markdown("#### Filter execution on the current attendance capture")
+        st.caption(f"Executed enhancement: {' -> '.join(result.stages)}.")
+        diagnostic_columns = st.columns(6)
         with diagnostic_columns[0]:
-            st.image(result.local_equalised, caption="1. Local histogram equalization", width="stretch")
+            st.image(result.contrast_enhanced, caption="1. CLAHE local contrast enhancement", width="stretch")
         with diagnostic_columns[1]:
-            st.image(result.wiener_filtered, caption="2. Adaptive Wiener filtering", width="stretch")
+            st.image(result.denoised, caption="2. Bilateral edge-preserving denoising", width="stretch")
         with diagnostic_columns[2]:
-            st.image(result.binary, caption="3. Adaptive local-mean binary", width="stretch")
+            st.image(result.detail_enhanced, caption="3. Mild unsharp ridge enhancement", width="stretch")
         with diagnostic_columns[3]:
-            st.image(result.thinned, caption="4. Morphological thinning", width="stretch")
+            st.image(result.binary, caption="4. Adaptive local-mean binary", width="stretch")
         with diagnostic_columns[4]:
-            st.image(result.enhanced, caption="5. Binary ridge post-processing", width="stretch")
+            st.image(result.thinned, caption="5. Morphological thinning", width="stretch")
+        with diagnostic_columns[5]:
+            st.image(result.enhanced, caption="6. Binary ridge post-processing", width="stretch")
         st.image(
             result.region_mask,
-            caption="System extension: variance foreground guard (not a numbered paper stage)",
+            caption="Texture-based fingertip foreground mask",
             width=260,
         )
         st.caption(
@@ -423,7 +524,7 @@ def page_mark_attendance() -> None:
     page_header(
         "Biometric verification",
         "Mark attendance",
-        "Select a live class, provide one fingerprint capture and let the paper-aligned filtering pipeline identify the enrolled student.",
+        "Select a live class, provide a fresh fingerprint capture and let the ridge-preserving enhancement pipeline identify the enrolled student.",
         "SCANNER READY",
     )
     sessions = list_sessions(active_only=True)
@@ -454,9 +555,15 @@ def page_mark_attendance() -> None:
             step=0.005,
         )
 
-    source_mode = st.radio("Fingerprint source", ["Upload scanner image", "Use labelled demo scan"], horizontal=True)
+    source_mode = st.radio(
+        "Fingerprint source",
+        ["Upload fingerprint photo", "Live camera capture", "Use labelled demo scan"],
+        horizontal=True,
+    )
     source = None
-    if source_mode == "Upload scanner image":
+    automatic_camera_verification = False
+    camera_digest = None
+    if source_mode == "Upload fingerprint photo":
         uploaded = st.file_uploader(
             "Drop a fingerprint capture",
             type=IMAGE_TYPES,
@@ -465,6 +572,28 @@ def page_mark_attendance() -> None:
         )
         if uploaded:
             source = uploaded.getvalue()
+    elif source_mode == "Live camera capture":
+        st.info(
+            "Place the enrolled fingertip in the centre, fill most of the frame and keep the ridges in focus. "
+            "After you press the camera's capture button, verification starts automatically."
+        )
+        st.caption(
+            "On macOS, an iPhone Continuity Camera can be selected as the browser camera, "
+            "including when the iPhone is connected by USB."
+        )
+        camera_capture = st.camera_input(
+            "Camera fingerprint capture",
+            key="attendance_camera",
+            help="The browser may ask for camera permission. Camera access stays on this local app.",
+        )
+        if camera_capture:
+            source = camera_capture.getvalue()
+            camera_digest = sha256(source).hexdigest()
+            automatic_camera_verification = (
+                st.session_state.get("last_live_camera_digest") != camera_digest
+            )
+            if not automatic_camera_verification:
+                st.caption("This camera image has already been checked. Retake the photo to run a new scan.")
     else:
         demo_scans = sorted(DEMO_SCAN_DIR.glob("*.png")) if DEMO_SCAN_DIR.exists() else []
         if not demo_scans:
@@ -474,12 +603,22 @@ def page_mark_attendance() -> None:
             chosen_demo = st.selectbox("Demo scanner capture", list(demo_map))
             source = demo_map[chosen_demo]
 
-    if st.button("Enhance, verify and mark attendance", type="primary", width="stretch"):
+    manual_verification = False
+    if source_mode != "Live camera capture":
+        manual_verification = st.button(
+            "Enhance, verify and mark attendance",
+            type="primary",
+            width="stretch",
+        )
+
+    if manual_verification or automatic_camera_verification:
         if source is None:
             st.warning("Provide a fingerprint capture first.")
         elif not list_templates():
             st.warning("No enrolled fingerprint templates are available.")
         else:
+            if camera_digest:
+                st.session_state["last_live_camera_digest"] = camera_digest
             try:
                 started = perf_counter()
                 with st.spinner("Enhancing ridges and comparing enrolled templates..."):
@@ -513,6 +652,8 @@ def page_mark_attendance() -> None:
                     "status": status,
                     "session_label": f"{selected_session['course_code']} / {selected_session['course_name']}",
                     "elapsed_ms": (perf_counter() - started) * 1000.0,
+                    "threshold": threshold,
+                    "ambiguity_margin": ambiguity,
                 }
             except ValueError as exc:
                 st.error(str(exc))
@@ -578,13 +719,12 @@ def page_enrolment() -> None:
                 try:
                     template_rows = []
                     preview_results = []
-                    with st.spinner("Running the paper-aligned local filtering stages..."):
+                    with st.spinner("Running ridge-preserving enhancement and quality checks..."):
                         for upload in uploads:
                             result = process_fingerprint(upload.getvalue())
-                            if result.quality["overall"] < 0.20:
-                                raise ValueError(
-                                    f"{upload.name} has insufficient ridge quality ({result.quality['overall']:.0%})."
-                                )
+                            quality_issue = capture_quality_issue(result)
+                            if quality_issue:
+                                raise ValueError(f"{upload.name}: {quality_issue}")
                             capture_key = f"{student_id.strip().lower()}_{uuid.uuid4().hex[:12]}"
                             path = TEMPLATE_DIR / f"{capture_key}_enhanced.png"
                             reference_path = REFERENCE_DIR / f"{capture_key}_reference.png"
@@ -599,7 +739,7 @@ def page_enrolment() -> None:
                                     "reference_path": str(reference_path.resolve()),
                                     "quality": result.quality["overall"],
                                     "clarity": result.quality["clarity"],
-                                    "minutiae_count": 0,
+                                    "minutiae_count": int(result.quality.get("minutiae_count", 0)),
                                     "profile": pipeline_payload(result),
                                 }
                             )
@@ -628,11 +768,30 @@ def page_enrolment() -> None:
 
         if "enrolment_preview" in st.session_state:
             preview: PipelineResult = st.session_state["enrolment_preview"][0]
-            preview_columns = st.columns(3)
-            preview_columns[0].image(preview.prepared, caption="Original input", width="stretch")
-            preview_columns[1].image(preview.wiener_filtered, caption="2. Wiener-filtered image", width="stretch")
-            preview_columns[2].image(preview.enhanced, caption="5. Stored enhanced binary", width="stretch")
-            st.caption(f"Executed enhancement: {' -> '.join(preview.stages)}.")
+            st.subheader("Stored biometric reference")
+            preview_columns = st.columns([1.05, 1], gap="large")
+            preview_columns[0].image(
+                preview.prepared,
+                caption="Canonical fingerprint reference saved for future attendance matching",
+                width="stretch",
+            )
+            with preview_columns[1]:
+                st.markdown("#### Extracted biometric profile")
+                profile_columns = st.columns(2)
+                profile_columns[0].metric("Capture quality", f"{preview.quality['overall']:.1%}")
+                profile_columns[1].metric("Ridge coherence", f"{preview.quality['ridge_coherence']:.1%}")
+                profile_columns[0].metric("Ridge continuity", f"{preview.quality['connectivity']:.1%}")
+                profile_columns[1].metric("Detected ridge points", f"{int(preview.quality.get('minutiae_count', 0)):,}")
+                st.info(
+                    "The system stores this normalized reference and a processed ridge template. "
+                    "Student information links those biometric records to the enrolled identity."
+                )
+            with st.expander("Show enrolment filter evidence"):
+                filter_columns = st.columns(3)
+                filter_columns[0].image(preview.contrast_enhanced, caption="1. CLAHE contrast", width="stretch")
+                filter_columns[1].image(preview.detail_enhanced, caption="3. Ridge detail enhancement", width="stretch")
+                filter_columns[2].image(preview.enhanced, caption="6. Stored binary template", width="stretch")
+                st.caption(f"Executed enhancement: {' -> '.join(preview.stages)}.")
 
     with right:
         st.subheader("Enrolment quality guide")
@@ -646,6 +805,8 @@ def page_enrolment() -> None:
             **Capture checklist**
 
             - Use a sharp image with visible ridge/valley contrast.
+            - Centre one upright fingertip against a plain, contrasting background.
+            - Use the 1x or macro camera, not 0.5x ultrawide; let the fingertip fill 60-80% of the frame.
             - Avoid motion blur, heavy moisture and clipped fingertip edges.
             - Keep every enrolment sample from the same finger.
             - Recapture when quality is labelled low.
@@ -693,11 +854,9 @@ def page_enrolment() -> None:
                         with st.spinner("Creating current-format reference captures..."):
                             for upload in existing_uploads:
                                 result = process_fingerprint(upload.getvalue())
-                                if result.quality["overall"] < 0.20:
-                                    raise ValueError(
-                                        f"{upload.name} has insufficient ridge quality "
-                                        f"({result.quality['overall']:.0%})."
-                                    )
+                                quality_issue = capture_quality_issue(result)
+                                if quality_issue:
+                                    raise ValueError(f"{upload.name}: {quality_issue}")
                                 capture_key = (
                                     f"{selected_student['student_id'].lower()}_"
                                     f"{uuid.uuid4().hex[:12]}"
@@ -714,7 +873,7 @@ def page_enrolment() -> None:
                                         "reference_path": str(reference_path.resolve()),
                                         "quality": result.quality["overall"],
                                         "clarity": result.quality["clarity"],
-                                        "minutiae_count": 0,
+                                        "minutiae_count": int(result.quality.get("minutiae_count", 0)),
                                         "profile": pipeline_payload(result),
                                     }
                                 )
@@ -953,8 +1112,9 @@ def render_studio_result(result: PipelineResult) -> None:
     required_outputs = (
         "stages",
         "region_mask",
-        "local_equalised",
-        "wiener_filtered",
+        "contrast_enhanced",
+        "denoised",
+        "detail_enhanced",
         "binary",
         "thinned",
         "enhanced",
@@ -963,29 +1123,30 @@ def render_studio_result(result: PipelineResult) -> None:
         st.session_state.pop("studio_result", None)
         st.warning(
             "The cached diagnostic result used an older processing pipeline. "
-            "Upload the image and run the paper-aligned filtering pipeline again."
+            "Upload the image and run the ridge-preserving enhancement pipeline again."
         )
         return
     st.info(f"Fixed executed sequence: **{' -> '.join(result.stages)}**.")
-    metrics = st.columns(5)
+    st.subheader("Foreground extraction (executed before every filter)")
+    foreground_columns = st.columns(3)
+    foreground_columns[0].image(result.original, caption="Phone photograph", width="stretch")
+    foreground_columns[1].image(result.prepared, caption="Cropped and normalized fingerprint ROI", width="stretch")
+    foreground_columns[2].image(result.region_mask, caption="Final ridge foreground mask", width="stretch")
+    metrics = st.columns(6)
     metrics[0].metric("Overall quality", f"{result.quality['overall']:.1%}")
     metrics[1].metric("Local contrast", f"{result.quality['contrast']:.1%}")
     metrics[2].metric("Noise suppression", f"{result.quality['noise_reduction']:.1%}")
     metrics[3].metric("Ridge continuity", f"{result.quality['connectivity']:.1%}")
-    metrics[4].metric("Runtime", f"{result.processing_ms:.0f} ms")
+    metrics[4].metric("Ridge coherence", f"{result.quality['ridge_coherence']:.1%}")
+    metrics[5].metric("Runtime", f"{result.processing_ms:.0f} ms")
 
-    stage_columns = st.columns(5)
-    stage_columns[0].image(result.local_equalised, caption="1. Local histogram equalization", width="stretch")
-    stage_columns[1].image(result.wiener_filtered, caption="2. Adaptive Wiener filtering", width="stretch")
-    stage_columns[2].image(result.binary, caption="3. Local-mean binarization", width="stretch")
-    stage_columns[3].image(result.thinned, caption="4. Morphological thinning", width="stretch")
-    stage_columns[4].image(result.enhanced, caption="5. Binary ridge post-processing", width="stretch")
-    with st.expander("System foreground extension"):
-        st.image(result.region_mask, caption="Variance-based foreground guard", width=320)
-        st.caption(
-            "This mask excludes scanner borders and blank background before the paper stages. "
-            "It is an implementation extension, not presented as one of Greenberg et al.'s numbered filters."
-        )
+    stage_columns = st.columns(6)
+    stage_columns[0].image(result.contrast_enhanced, caption="1. CLAHE local contrast enhancement", width="stretch")
+    stage_columns[1].image(result.denoised, caption="2. Bilateral edge-preserving denoising", width="stretch")
+    stage_columns[2].image(result.detail_enhanced, caption="3. Mild unsharp ridge enhancement", width="stretch")
+    stage_columns[3].image(result.binary, caption="4. Local-mean binarization", width="stretch")
+    stage_columns[4].image(result.thinned, caption="5. Morphological thinning", width="stretch")
+    stage_columns[5].image(result.enhanced, caption="6. Binary ridge post-processing", width="stretch")
 
 
 def page_algorithm_studio() -> None:
@@ -993,7 +1154,7 @@ def page_algorithm_studio() -> None:
         "Image processing evidence",
         "Fingerprint enhancement studio",
         "Inspect each filtering result from local contrast enhancement to the final cleaned binary ridges.",
-        "FIVE PAPER STAGES",
+        "RIDGE-PRESERVING PIPELINE",
     )
     st.subheader("Fixed production pipeline")
     pipeline_strip()
@@ -1007,7 +1168,7 @@ def page_algorithm_studio() -> None:
             st.warning("Upload a fingerprint image first.")
         else:
             try:
-                with st.spinner("Running the complete Greenberg filtering pipeline..."):
+                with st.spinner("Running the complete ridge-preserving enhancement pipeline..."):
                     st.session_state["studio_result"] = process_fingerprint(upload.getvalue())
             except Exception as exc:
                 st.error(f"The image could not be analysed: {exc}")
@@ -1015,34 +1176,34 @@ def page_algorithm_studio() -> None:
         render_studio_result(st.session_state["studio_result"])
 
     st.divider()
-    st.subheader("Paper method comparison")
+    st.subheader("Enhancement method comparison")
     st.caption(
-        "Method properties taken from the selected paper. The application does not invent accuracy values; "
+        "The app uses the method that preserves visible phone-camera evidence. It does not invent accuracy values; "
         "submit quantitative claims only after running a labelled evaluation dataset."
     )
     comparison = pd.DataFrame(
         [
-            ["Binary filtering (implemented)", "Local histogram + Wiener", "No", "Binary skeleton", "Production pipeline"],
-            ["Modified Gabor", "Orientation + ridge frequency", "Yes", "Greyscale", "Paper comparison method"],
-            ["Anisotropic filtering", "Local orientation", "No", "Greyscale", "Paper comparison method"],
+            ["CLAHE + bilateral + mild unsharp", "Local contrast + edge-preserving detail", "No", "Greyscale + binary", "Production pipeline"],
+            ["STFT contextual filtering", "Local ridge frequency + orientation", "Yes", "Greyscale", "Rejected for current phone captures: synthetic coarse lines"],
+            ["Modified Gabor", "Orientation + ridge frequency", "Yes", "Greyscale", "Future controlled-capture comparison"],
         ],
         columns=["Method", "Main information", "Frequency required", "Output", "Use here"],
     )
     st.dataframe(comparison, width="stretch", hide_index=True)
     st.info(
-        "The previous Assignment IP table is historical report evidence and was not rerun by this app. "
-        "The live pipeline now implements the filtering technique in the selected Greenberg paper."
+        "Do not report accuracy from this comparison table. Measure genuine and impostor captures on a labelled test set."
     )
 
     with st.expander("Implementation pseudocode"):
         st.code(
             """INPUT greyscale fingerprint capture
 SYSTEM EXTENSION: locate fingerprint foreground and reject scanner borders
-1. APPLY local histogram equalization with an 11 x 11 neighbourhood
-2. APPLY pixel-wise adaptive Wiener filtering with a 3 x 3 neighbourhood
-3. BINARIZE each pixel against its 13 x 13 local intensity mean
-4. THIN black ridge components to one-pixel centre lines
-5. REMOVE false ridges shorter than 10 pixels and close small ridge gaps
+1. APPLY CLAHE local contrast enhancement with clip limit 2.0
+2. APPLY edge-preserving bilateral denoising with a 5 x 5 neighbourhood
+3. APPLY a mild unsharp mask (sigma 0.8) to existing ridge edges
+4. BINARIZE each pixel against its 13 x 13 local intensity mean
+5. THIN black ridge components to one-pixel centre lines
+6. REMOVE false ridges shorter than 10 pixels and close small ridge gaps
 
 SEPARATE ATTENDANCE FUNCTION (after enhancement)
 COMPARE query to each canonical enrolment reference with SIFT-RANSAC geometry
@@ -1113,6 +1274,8 @@ def page_system() -> None:
             - **Reference matching:** A consistently sized greyscale copy of each enrolment upload is retained as the canonical local reference alongside its enhanced binary result.
             - **Duplicate control:** A student can be recorded only once per class session.
             - **Transparent scores:** Reference SIFT, enhanced ORB, structural and spectral evidence remain visible for each decision.
+            - **Browser camera capture:** A fresh camera still can trigger verification automatically, but it is not a certified liveness check.
+            - **No liveness proof:** Uploads and camera stills remain vulnerable to replay without anti-spoofing or challenge-response controls.
             - **Prototype scope:** This system supports an image-processing assignment; it is not certified for forensic or high-security identity use.
             """
         )
@@ -1125,8 +1288,8 @@ def page_system() -> None:
         st.markdown(
             """
             **Input manager** validates image formats and supplies a consistent array size for database comparison.  
-            **Enhancement engine** executes local histogram equalization, adaptive Wiener filtering, adaptive local-mean binarization, thinning and binary ridge repair.<br>
-            **Matching service** compares each scan to canonical enrolment uploads, then fuses enhanced and structural evidence with threshold and ambiguity guards.  
+            **Enhancement engine** executes CLAHE contrast enhancement, bilateral edge-preserving denoising, mild unsharp enhancement, local-mean binarization, thinning and ridge repair.<br>
+            **Matching service** compares each fresh capture to canonical enrolment references, then applies similarity, geometric-inlier and ambiguity guards.
             **Attendance database** integrates students, templates, sessions, records and audit events.  
             **Reporting module** exports complete class rosters to CSV and polished PDF.
             """
@@ -1135,14 +1298,15 @@ def page_system() -> None:
         st.subheader("Assignment feature coverage")
         coverage = pd.DataFrame(
             [
-                ["Preprocessing", "Implemented", "Local histogram equalization, adaptive Wiener noise reduction and local-mean binarization"],
-                ["Image calibration", "Not included", "Removed to follow the requested enhancement diagram exactly"],
-                ["Object detection", "Implemented", "Connected fingerprint segmentation rejects scanner frames and empty background"],
+                ["Preprocessing", "Implemented", "CLAHE corrects uneven local contrast with clipped amplification"],
+                ["Main filter", "Implemented", "Bilateral filtering suppresses camera noise while preserving ridge boundaries"],
+                ["Object detection", "Implemented", "Centre-seeded colour and boundary segmentation crops and normalizes the fingertip"],
                 ["Data dashboard", "Implemented", "Quality, enhancement, matching and attendance summaries"],
                 ["PDF reporting", "Implemented", "Automatic class attendance register with verification evidence"],
                 ["Bulk GUI ingestion", "Implemented", "One to three same-finger captures through multi-image selection"],
                 ["Supplemental functions", "Implemented", "Foreground guard, binary ridge repair, reference-score fusion and ambiguity guard"],
-                ["Video processing", "Not applicable", "Attendance verification uses deliberate still scanner captures"],
+                ["Browser camera capture", "Implemented", "A captured camera still automatically starts enhancement, identification and attendance"],
+                ["Continuous video liveness", "Future work", "Video tracking, challenge-response and anti-replay require a dedicated liveness design"],
             ],
             columns=["Rubric item", "Status", "System evidence"],
         )
@@ -1193,7 +1357,7 @@ st.sidebar.markdown(
 st.sidebar.divider()
 side_stats = dashboard_statistics()
 st.sidebar.caption(
-    f"{side_stats['students']} students / {side_stats['active_sessions']} live sessions / paper-aligned filtering"
+    f"{side_stats['students']} students / {side_stats['active_sessions']} live sessions / ridge-preserving enhancement"
 )
 
 PAGES[st.session_state["navigation"]]()

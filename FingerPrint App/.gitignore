@@ -1,0 +1,18 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Sensitive local biometric and student data
+data/attendance.db
+data/attendance.db-*
+data/templates/
+data/references/
+data/demo_scans/
+data/backups/
+
+# Local runtime state and logs
+data/streamlit-process.json
+data/streamlit-output.log
+data/streamlit-error.log

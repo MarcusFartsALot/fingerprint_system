@@ -2,116 +2,100 @@
 
 ## Selected technique
 
-This system implements the binarization-based fingerprint enhancement method
-presented by Greenberg et al. The method was selected because it produces a
-clean binary ridge map through a reproducible sequence of local contrast
-enhancement, adaptive noise removal, local thresholding and morphology. It does
-not require ridge-frequency estimation and is therefore straightforward to
-explain, inspect and execute in a live Streamlit attendance application.
+The production pipeline uses **edge-preserving bilateral filtering** as its main
+denoising filter, supported by Contrast Limited Adaptive Histogram Equalization
+(CLAHE) and a mild unsharp mask. This is a classical image-processing and image-
+enhancement pipeline; it does not use a neural network.
 
-The paper also discusses a direct greyscale anisotropic method and compares it
-with modified Gabor filtering. Those methods are comparison alternatives, not
-stages mixed into the selected production pipeline.
+STFT was tested but is not used in production. On the supplied phone photographs,
+its local frequency and orientation estimates were unstable because of curved
+skin, glare, creases, pores and changing ridge scale. It consequently generated
+coarse periodic lines that were not present in the input. A visually strong but
+synthetic ridge is unsafe biometric evidence.
 
-## Processing sequence
+## Executed processing sequence
 
-### 1. Local histogram equalization
-
-For every pixel, the grey value is remapped using the intensity distribution in
-an `11 x 11` neighbourhood. This expands weak local ridge/valley contrast more
-effectively than one global histogram operation when illumination or sensor
-pressure varies across the fingertip.
-
-### 2. Adaptive Wiener filtering
-
-A pixel-wise Wiener filter uses a `3 x 3` neighbourhood to estimate the local
-mean and variance. Smoother regions receive stronger noise suppression, while
-high-variance ridge detail is retained. The system estimates image noise from
-the median local variance inside the detected fingerprint foreground.
-
-### 3. Adaptive local-mean binarization
-
-Each filtered pixel is compared with the mean intensity in its `13 x 13`
-neighbourhood. Pixels darker than the local mean become black ridge pixels;
-other pixels become white valleys/background. A local threshold handles gradual
-brightness changes better than one threshold for the full image.
-
-### 4. Morphological thinning
-
-The black binary ridges are skeletonized to one-pixel-wide centre lines. This
-creates a consistent ridge representation for morphology and diagnostic review.
-
-### 5. Binary ridge post-processing
-
-Connected ridge fragments shorter than 10 pixels are treated as false ridges and
-removed. A small cross-shaped morphological closing joins minor discontinuities,
-after which the result is skeletonized again to preserve one-pixel ridge width.
-
-## Explicit system extension
-
-Before the five paper stages, a local-variance foreground guard rejects blank
-background and scanner/page borders. It is an engineering safeguard for uploads,
-not an extra filtering stage attributed to the paper. Resizing and padding also
-standardize array dimensions for comparison without being described as image
-enhancement.
+1. **Foreground extraction.** Centre-seeded colour and boundary segmentation
+   isolates the fingertip. Ridge coherence refines the mask, the crop is resized
+   without distortion to a `360 x 360` canvas, and pixels outside the mask are
+   whitened.
+2. **CLAHE (`8 x 8` tile grid, clip limit `2.0`).** Local illumination is
+   corrected while the clip limit prevents unrestricted noise amplification.
+3. **Bilateral filtering (`5 x 5`, colour sigma `12`, spatial sigma `3`).** This
+   is the main filter. It suppresses small camera noise while weighting across
+   strong intensity changes less heavily, so ridge boundaries remain sharper
+   than with ordinary averaging.
+4. **Mild unsharp enhancement (sigma `0.8`, amount `0.75`).** Only edges already
+   present in the photograph are strengthened. No ridge frequency is invented.
+5. **Adaptive local-mean binarization (`13 x 13`).** Pixels darker than their
+   local mean become black ridge candidates.
+6. **Morphological thinning.** Candidate ridges are reduced to one-pixel centre
+   lines.
+7. **Binary ridge repair.** Short isolated components are removed and small gaps
+   are closed before a final skeletonization.
 
 ## Pseudocode
 
 ```text
-INPUT greyscale fingerprint image
-PREPARE a fixed comparison canvas without geometric distortion
-DETECT fingerprint foreground using local variance (system extension)
-
-EQUALIZED <- local histogram equalization(INPUT, window=11 x 11)
-FILTERED  <- adaptive Wiener filter(EQUALIZED, window=3 x 3)
-BINARY    <- FILTERED <= local mean(FILTERED, window=13 x 13)
-THINNED   <- skeletonize(BINARY ridges)
-ENHANCED  <- remove ridge components shorter than 10 pixels
-ENHANCED  <- close small gaps and skeletonize again
-
-RETURN EQUALIZED, FILTERED, BINARY, THINNED, ENHANCED
+INPUT fingerprint photograph
+ROI, MASK <- segment and crop central ridge-bearing fingertip
+PREPARED <- resize ROI without distortion and whiten outside MASK
+CONTRAST <- CLAHE(PREPARED, tile grid 8 x 8, clip limit 2.0)
+DENOISED <- bilateral filter(CONTRAST, diameter 5, sigma colour 12, sigma space 3)
+DETAIL <- unsharp mask(DENOISED, sigma 0.8, amount 0.75)
+BINARY <- DETAIL <= local mean(DETAIL, 13 x 13)
+THINNED <- skeletonize(BINARY ridges)
+TEMPLATE <- remove short false ridges, close small gaps, skeletonize
+RETURN diagnostic stages, TEMPLATE and quality measures
 ```
 
-## Separation from identity matching
+## What is stored and compared
 
-Enhancement improves visibility but does not itself decide student identity. A
-new attendance scan is compared with the original greyscale enrolment reference
-using SIFT-RANSAC geometry. ORB, aligned structural and spectral comparisons are
-secondary evidence. Acceptance requires a score above the configured threshold
-and a sufficient lead over the next-best student. This separation allows two
-different captures of the same finger to match without demanding pixel equality.
+The system does not identify a person using file metadata or EXIF. Each
+enrolment stores a normalized greyscale reference plus a processed binary
+template. The primary attendance comparison uses local SIFT descriptors and
+RANSAC geometric consistency on the greyscale references. Enhanced ORB,
+structural and spectral scores provide secondary evidence.
 
-## Evaluation plan
+This local matching design gives limited tolerance to a small dot, crumb or
+other obstruction: features in the unobstructed overlap can still agree
+geometrically. The application must not blur a large obstruction away or
+pretend to reconstruct hidden ridges. A large dirty, wet, glared or blurred area
+should cause a low-quality decision and request another capture.
 
-Quantitative claims should be generated from a labelled dataset rather than
-copied from a previous experiment. Use separate enrolment and query captures for
-each finger, then report:
+Enrol two or three genuinely different captures of the same finger. Reusing one
+file tests duplicate-image recognition, not biometric recognition.
 
-- true accept rate and false reject rate for genuine pairs;
-- false accept rate for different-finger pairs;
-- precision, recall, F1 and accuracy at the selected decision threshold;
-- average processing time per image;
-- image measures before and after filtering, such as local contrast, ridge
-  continuity and removed high-frequency noise;
-- representative successful, rejected and failure-case images.
+## Evaluation
 
-Threshold selection must be performed on validation data and evaluated on a
-held-out test set. The current UI quality percentages are diagnostic image
-measures, not biometric accuracy or a forensic certification.
+Use separate labelled enrolment and query captures. Add controlled occlusion
+tests (for example 0%, 5%, 10%, 20% and 30% of the ridge region covered) and
+report true accept rate, false reject rate, false accept rate and processing
+time. Select the acceptance threshold using a validation split, then report the
+final result on a held-out test split.
 
-## Limitations and critical discussion
+A scanner dataset is useful for proving the enhancement algorithm, but it does
+not by itself validate phone photographs. Report scanner and phone experiments
+as separate capture domains.
 
-The method can remove genuine short ridge fragments along with noise, and local
-thresholding may create broken ridges in extremely dry, wet or blurred captures.
-The variance foreground guard is tuned for scanner-style images and may require
-adjustment for another sensor. SIFT-based identification is tolerant of modest
-rotation and displacement but is not a replacement for a certified minutiae
-matcher or liveness detection. These limitations should be stated alongside the
-experimental results.
+## Capture guidance and limits
 
-## Reference
+Use the `1x` or macro camera, diffuse light, a plain background and a clean dry
+finger. Let the fingertip fill roughly 60-80% of the guide. Enhancement cannot
+recover ridge detail that was never focused or was completely hidden.
 
-Greenberg, S., Aladjem, M., Kogan, D., & Dimitrov, I. (2000). Fingerprint image
-enhancement using filtering techniques. *Proceedings of the 15th International
-Conference on Pattern Recognition*. Extended journal version:
-https://doi.org/10.1006/rtim.2001.0283.
+The browser camera can acquire a fresh still and automatically trigger matching,
+but neither a file upload nor a camera still proves liveness. Deployment needs
+continuous-video challenge-response or other anti-replay checks, consent, access
+control, encryption and a retention/deletion policy. This remains an educational
+prototype.
+
+## References
+
+- OpenCV, *CLAHE class and histogram equalization documentation*:
+  https://docs.opencv.org/4.x/d6/db6/classcv_1_1CLAHE.html
+- OpenCV, *Smoothing Images: Bilateral Filtering*:
+  https://docs.opencv.org/4.x/d4/d13/tutorial_py_filtering.html
+- Jea, T.-Y., & Govindaraju, V. (2005), *A minutia-based partial fingerprint
+  recognition system*, Pattern Recognition, 38(10), 1672-1684.
+  https://doi.org/10.1016/j.patcog.2005.03.016

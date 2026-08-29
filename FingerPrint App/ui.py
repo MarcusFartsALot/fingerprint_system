@@ -162,7 +162,7 @@ def apply_theme() -> None:
 
         .pipeline {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(7, minmax(0, 1fr));
             gap: .55rem;
             min-width: 0;
             margin: .8rem 0 1.2rem;
@@ -286,11 +286,13 @@ def result_banner(kind: str, title: str, copy: str) -> None:
 
 def pipeline_strip() -> None:
     steps = [
-        ("01", "Local histogram equalization", "Expand ridge contrast in each 11 x 11 neighbourhood"),
-        ("02", "Adaptive Wiener filtering", "Suppress local noise with a pixel-wise 3 x 3 estimate"),
-        ("03", "Local-mean binarization", "Compare each pixel with its 13 x 13 neighbourhood mean"),
-        ("04", "Morphological thinning", "Reduce black ridges to one-pixel-wide centre lines"),
-        ("05", "Binary ridge post-processing", "Remove short false ridges and close small gaps"),
+        ("00", "Fingerprint ROI extraction", "Separate, crop and normalize the ridge-bearing fingertip foreground"),
+        ("01", "CLAHE contrast enhancement", "Increase local ridge contrast while limiting noise amplification"),
+        ("02", "Bilateral denoising", "Suppress camera noise while preserving narrow ridge boundaries"),
+        ("03", "Mild unsharp enhancement", "Strengthen ridge edges already present in the photograph"),
+        ("04", "Local-mean binarization", "Compare each pixel with its 13 x 13 neighbourhood mean"),
+        ("05", "Morphological thinning", "Reduce black ridges to one-pixel-wide centre lines"),
+        ("06", "Binary ridge post-processing", "Remove short false ridges and close small gaps"),
     ]
     cards = "".join(
         f'<div class="pipe-step"><div class="pipe-num">{number}</div><div class="pipe-name">{name}</div><div class="pipe-copy">{copy}</div></div>'
