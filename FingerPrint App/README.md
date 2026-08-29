@@ -62,6 +62,17 @@ python3 -m streamlit run app.py
 Stop it with `Control+C`. Runtime databases, biometric images, logs and backups
 remain ignored by Git and are created locally on each computer.
 
+After the one-time installation above, Finder users can double-click
+`START_APP.command` to start the background server and open the browser. Double-
+click `STOP_APP.command` to stop it. The Git branch stores both files as
+executable. If macOS blocks the first launch, Control-click the file, choose
+**Open**, and approve it. If executable permission was lost while copying the
+folder outside Git, restore it once with:
+
+```bash
+chmod +x START_APP.command STOP_APP.command
+```
+
 For a sharper live capture, a compatible iPhone can appear to macOS as a webcam
 through Continuity Camera. It works wirelessly or over USB. Connect and trust the
 Mac, enable Continuity Camera under **iPhone Settings > General > AirPlay &

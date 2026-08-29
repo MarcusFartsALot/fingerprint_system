@@ -14,5 +14,6 @@ data/backups/
 
 # Local runtime state and logs
 data/streamlit-process.json
+data/streamlit-process.pid
 data/streamlit-output.log
 data/streamlit-error.log
