@@ -14,11 +14,18 @@ from database import (
     add_fingerprint_templates,
     attendance_records,
     create_session,
+    delete_session,
+    delete_student,
     enrol_student,
+    get_session,
+    get_student,
     initialise_database,
+    list_sessions,
     list_templates,
     mark_attendance,
     session_roster,
+    update_session,
+    update_student,
 )
 from fingerprint_processing import generate_demo_fingerprint, process_fingerprint
 from matching import (
@@ -277,6 +284,54 @@ class PersistenceAndReportingTests(unittest.TestCase):
             attendance_status(session, starts + timedelta(minutes=11)),
             "Late",
         )
+
+    def test_student_can_be_edited_and_deleted_with_related_records(self) -> None:
+        update_student(
+            "S100",
+            {
+                "full_name": "Updated Student",
+                "programme": "Bachelor of Data Science (Honours)",
+                "study_year": 4,
+                "tutorial_group": "T9",
+                "email": "updated@example.test",
+                "status": "Inactive",
+            },
+            self.database,
+        )
+        updated = get_student("S100", self.database)
+        self.assertEqual(updated["full_name"], "Updated Student")
+        self.assertEqual(updated["status"], "Inactive")
+
+        mark_attendance(self.session_id, "S100", "Present", 0.82, 0.71, 110, self.database)
+        delete_student("S100", self.database)
+        self.assertIsNone(get_student("S100", self.database))
+        self.assertEqual(list_templates(self.database), [])
+        self.assertEqual(attendance_records(database_path=self.database), [])
+
+    def test_session_can_be_edited_and_deleted_with_attendance(self) -> None:
+        new_start = datetime.now().astimezone() + timedelta(days=1)
+        update_session(
+            self.session_id,
+            {
+                "course_code": "NEW100",
+                "course_name": "Updated Class",
+                "venue": "Lab 9",
+                "lecturer": "Updated Lecturer",
+                "starts_at": new_start,
+                "grace_minutes": 20,
+                "active": False,
+            },
+            self.database,
+        )
+        updated = get_session(self.session_id, self.database)
+        self.assertEqual(updated["course_code"], "NEW100")
+        self.assertEqual(updated["active"], 0)
+        self.assertIsNotNone(updated["ends_at"])
+
+        mark_attendance(self.session_id, "S100", "Late", 0.82, 0.71, 110, self.database)
+        delete_session(self.session_id, self.database)
+        self.assertEqual(list_sessions(database_path=self.database), [])
+        self.assertEqual(attendance_records(database_path=self.database), [])
 
 if __name__ == "__main__":
     unittest.main()

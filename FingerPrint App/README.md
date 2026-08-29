@@ -144,16 +144,31 @@ forensic or high-security biometric certification.
 | `tests/test_system.py` | Processing, matching, database and report regression tests |
 | `FILTERING_METHODOLOGY.md` | Assignment-ready filtering rationale, pseudocode and evaluation guidance |
 
+### Folder guide
+
+| Folder | Keep? | Purpose |
+|---|---|---|
+| `.streamlit/` | Yes | Local Streamlit server configuration |
+| `data/` | Yes | Local database, enrolled fingerprint references, reports and runtime logs |
+| `scripts/` | Yes | Start/stop logic used by the double-click launcher files |
+| `tests/` | Recommended | Automated evidence that processing, matching, duplicate prevention and database editing still work |
+| `__pycache__/` | No | Generated Python cache; safe to remove and already ignored by Git |
+
+For a presentation, open the application using `START_APP.command` on macOS or
+`START_APP.bat` on Windows. Present the interface, then use
+`FILTERING_METHODOLOGY.md` when explaining the enhancement pipeline. The source
+and test folders do not need to be opened during the live demonstration.
+
 ## Demonstration workflow
 
-1. Open **System & help** and select **Load or repair demo cohort**.
-2. Open **Mark attendance** and select the generated BMDS2133 session.
-3. Choose **Use labelled demo scan**, select a student and run verification.
-4. Review the matching evidence and filtering-stage images.
-5. Open **Attendance records** to export the class register.
-
-Synthetic demo records are marked `(Demo)` and must not be reported as real
-experimental measurements.
+1. Open **Student enrolment**, enter a student and upload two or three captures
+   of the same finger.
+2. Open **Class sessions** and create a class session.
+3. Open **Mark attendance**, select that session and use either **Upload
+   fingerprint photo** or **Live camera capture**.
+4. Review the matched enrolment reference, match score and technical filter
+   evidence.
+5. Open **Attendance records**, select the session and export its register.
 
 For a physical capture, choose **Live camera capture**, allow browser camera
 permission and take a still image. The new capture is processed and matched

@@ -125,7 +125,15 @@ def apply_theme() -> None:
             right: -1.8rem;
         }
         .stat-label { color: var(--muted); font-size: .73rem; font-weight: 650; }
-        .stat-value { color: var(--text); font-size: 1.72rem; font-weight: 790; letter-spacing: -.04em; margin-top: .62rem; line-height: 1; }
+        .stat-value {
+            color: var(--text);
+            font-size: clamp(1.3rem, 2.1vw, 1.72rem);
+            font-weight: 790;
+            letter-spacing: -.04em;
+            margin-top: .62rem;
+            line-height: 1.05;
+            overflow-wrap: anywhere;
+        }
         .stat-note { color: #698178; font-size: .68rem; margin-top: .52rem; }
 
         .section-card, div[data-testid="stForm"] {
@@ -181,15 +189,46 @@ def apply_theme() -> None:
             background: rgba(11, 22, 17, .7);
             border-color: rgba(54, 217, 148, .18);
         }
-        .stButton > button, .stDownloadButton > button, button[kind="primary"] {
+        /* Keep every action readable across Streamlit versions and button types. */
+        .stButton > button,
+        .stDownloadButton > button,
+        [data-testid="stFormSubmitButton"] button,
+        [data-testid="stFileUploader"] button,
+        [data-testid="stCameraInput"] button {
             border-radius: 11px !important;
             min-height: 2.55rem;
-            font-weight: 680 !important;
-            border-color: rgba(54, 217, 148, .25) !important;
+            font-weight: 800 !important;
+            border-color: #36d994 !important;
+            background: #36d994 !important;
+            color: #03110a !important;
+            opacity: 1 !important;
         }
-        button[kind="primary"] {
-            background: linear-gradient(135deg, #23c982, #0e8d5d) !important;
-            color: #04100b !important;
+        .stButton > button *,
+        .stDownloadButton > button *,
+        [data-testid="stFormSubmitButton"] button *,
+        [data-testid="stFileUploader"] button *,
+        [data-testid="stCameraInput"] button * {
+            color: #03110a !important;
+            fill: #03110a !important;
+            opacity: 1 !important;
+        }
+        .stButton > button:hover,
+        .stDownloadButton > button:hover,
+        [data-testid="stFormSubmitButton"] button:hover,
+        [data-testid="stFileUploader"] button:hover,
+        [data-testid="stCameraInput"] button:hover {
+            background: #62e4ad !important;
+            border-color: #62e4ad !important;
+            color: #020a06 !important;
+        }
+        .stButton > button:disabled,
+        [data-testid="stFormSubmitButton"] button:disabled,
+        [data-testid="stFileUploader"] button:disabled,
+        [data-testid="stCameraInput"] button:disabled {
+            background: #788a81 !important;
+            border-color: #788a81 !important;
+            color: #06100b !important;
+            cursor: not-allowed !important;
         }
         [data-baseweb="select"] > div, .stTextInput input, .stNumberInput input, .stDateInput input, .stTimeInput input {
             background-color: #101c17 !important;
@@ -202,9 +241,24 @@ def apply_theme() -> None:
             border-radius: 14px;
             padding: .8rem .9rem;
         }
-        [data-testid="stMetricValue"] { color: var(--text); }
+        [data-testid="stMetricValue"] {
+            color: var(--text);
+            overflow: visible !important;
+        }
+        [data-testid="stMetricValue"] > div {
+            font-size: clamp(1.25rem, 2.25vw, 2rem) !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere;
+            text-overflow: clip !important;
+        }
         [data-testid="stAlert"] { border-radius: 13px; }
         [data-testid="stImage"] img { border-radius: 13px; border: 1px solid var(--line); }
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: rgba(211, 238, 225, .14) !important;
+            border-radius: 17px !important;
+            background: rgba(12, 23, 18, .52);
+        }
+        .ui-spacer { height: .8rem; }
         .mono-note {
             border: 1px solid var(--line);
             background: #070d0a;
@@ -216,10 +270,24 @@ def apply_theme() -> None:
         }
         .privacy-note { color: #6f857b; font-size: .67rem; line-height: 1.45; padding: .75rem .15rem 0; }
 
+        @media (max-width: 1500px) {
+            [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+            [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                flex: 1 1 calc(50% - .6rem) !important;
+                min-width: min(14rem, 100%) !important;
+                width: auto !important;
+            }
+            .block-container { padding-left: 1.2rem; padding-right: 1.2rem; }
+        }
         @media (max-width: 900px) {
+            [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                flex-basis: 100% !important;
+            }
             .pipeline { grid-template-columns: repeat(2, 1fr); }
             .session-strip { grid-template-columns: 1fr 1fr; }
             .page-head { align-items: flex-start; flex-direction: column; }
+            .page-title { font-size: 1.75rem; }
+            .stat-card { min-height: 6.25rem; }
         }
         </style>
         """,

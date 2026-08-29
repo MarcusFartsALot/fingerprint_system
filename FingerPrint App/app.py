@@ -21,6 +21,14 @@ import streamlit as st
 
 import fingerprint_processing as fingerprint_module
 import matching as matching_module
+import database as database_module
+import ui as ui_module
+
+# Streamlit reruns this file in the same Python process. Reload the lightweight
+# persistence module so newly added administration functions are immediately
+# available instead of leaving an older module cached in sys.modules.
+database_module = importlib.reload(database_module)
+ui_module = importlib.reload(ui_module)
 
 from database import (
     DATA_DIR,
@@ -29,11 +37,11 @@ from database import (
     TEMPLATE_DIR,
     add_fingerprint_templates,
     attendance_records,
-    close_session,
     create_session,
     dashboard_statistics,
+    delete_session,
+    delete_student,
     enrol_student,
-    get_session,
     get_student,
     initialise_database,
     list_sessions,
@@ -43,6 +51,8 @@ from database import (
     mark_attendance,
     recent_audit_events,
     session_roster,
+    update_session,
+    update_student,
 )
 # Streamlit can retain an older imported module while hot-reloading this file.
 # Reload only when the processing module's public interface has changed.
@@ -126,7 +136,7 @@ def fmt_datetime(value: str | None, short: bool = False) -> str:
 
 def session_label(session: dict) -> str:
     live = "LIVE" if session.get("active") else "CLOSED"
-    return f"{session['course_code']} - {fmt_datetime(session['starts_at'], short=True)} - {live}"
+    return f"#{session['session_id']} · {session['course_code']} · {fmt_datetime(session['starts_at'], short=True)} · {live}"
 
 
 def navigate_to(page: str) -> None:
@@ -557,7 +567,7 @@ def page_mark_attendance() -> None:
 
     source_mode = st.radio(
         "Fingerprint source",
-        ["Upload fingerprint photo", "Live camera capture", "Use labelled demo scan"],
+        ["Upload fingerprint photo", "Live camera capture"],
         horizontal=True,
     )
     source = None
@@ -577,10 +587,6 @@ def page_mark_attendance() -> None:
             "Place the enrolled fingertip in the centre, fill most of the frame and keep the ridges in focus. "
             "After you press the camera's capture button, verification starts automatically."
         )
-        st.caption(
-            "On macOS, an iPhone Continuity Camera can be selected as the browser camera, "
-            "including when the iPhone is connected by USB."
-        )
         camera_capture = st.camera_input(
             "Camera fingerprint capture",
             key="attendance_camera",
@@ -594,15 +600,6 @@ def page_mark_attendance() -> None:
             )
             if not automatic_camera_verification:
                 st.caption("This camera image has already been checked. Retake the photo to run a new scan.")
-    else:
-        demo_scans = sorted(DEMO_SCAN_DIR.glob("*.png")) if DEMO_SCAN_DIR.exists() else []
-        if not demo_scans:
-            st.info("Load the labelled demo cohort from System & help to enable demo scanner inputs.")
-        else:
-            demo_map = {path.stem.replace("_", " "): path for path in demo_scans}
-            chosen_demo = st.selectbox("Demo scanner capture", list(demo_map))
-            source = demo_map[chosen_demo]
-
     manual_verification = False
     if source_mode != "Live camera capture":
         manual_verification = st.button(
@@ -916,6 +913,76 @@ def page_enrolment() -> None:
             width="stretch",
             hide_index=True,
         )
+
+        st.markdown("#### Manage a student")
+        student_map = {
+            f"{student['student_id']} · {student['full_name']}": student
+            for student in students
+        }
+        managed_label = st.selectbox("Student record", list(student_map), key="managed_student")
+        managed = student_map[managed_label]
+        edit_tab, delete_tab = st.tabs(["Edit details", "Delete record"])
+        with edit_tab:
+            with st.form(f"edit_student_{managed['student_id']}"):
+                st.text_input("Student ID", value=managed["student_id"], disabled=True)
+                edited_name = st.text_input("Full name", value=managed["full_name"])
+                programme_options = list(PROGRAMMES)
+                if managed["programme"] not in programme_options:
+                    programme_options.append(managed["programme"])
+                edited_programme = st.selectbox(
+                    "Programme",
+                    programme_options,
+                    index=programme_options.index(managed["programme"]),
+                )
+                edit_left, edit_right = st.columns(2)
+                edited_year = edit_left.number_input(
+                    "Year of study", min_value=1, max_value=8, value=int(managed["study_year"])
+                )
+                edited_group = edit_right.text_input("Tutorial group", value=managed["tutorial_group"])
+                edited_email = st.text_input("Email", value=managed.get("email", ""))
+                edited_status = st.selectbox(
+                    "Status",
+                    ["Active", "Inactive"],
+                    index=0 if managed.get("status") == "Active" else 1,
+                    help="Inactive students remain in the directory but are excluded from matching and class rosters.",
+                )
+                save_student = st.form_submit_button("Save student changes", type="primary", width="stretch")
+            if save_student:
+                try:
+                    update_student(
+                        managed["student_id"],
+                        {
+                            "full_name": edited_name,
+                            "programme": edited_programme,
+                            "study_year": int(edited_year),
+                            "tutorial_group": edited_group,
+                            "email": edited_email,
+                            "status": edited_status,
+                        },
+                    )
+                    st.success("Student details updated.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+        with delete_tab:
+            st.warning(
+                "Deleting this student also removes their fingerprint templates and attendance entries. "
+                "This cannot be undone."
+            )
+            confirm_student_delete = st.checkbox(
+                f"I understand and want to delete {managed['student_id']}",
+                key=f"confirm_student_delete_{managed['student_id']}",
+            )
+            if st.button(
+                "Delete student permanently",
+                key=f"delete_student_{managed['student_id']}",
+                disabled=not confirm_student_delete,
+                width="stretch",
+            ):
+                removed_files = delete_student(managed["student_id"])
+                st.session_state.pop("last_scan", None)
+                st.success(f"Student deleted. {removed_files} local fingerprint file(s) removed.")
+                st.rerun()
     else:
         st.caption("No students are enrolled yet.")
 
@@ -965,13 +1032,8 @@ def page_sessions() -> None:
             st.caption("No sessions are currently open.")
         for session in active:
             render_session_strip(session)
-            if st.button(
-                f"Close {session['course_code']} session",
-                key=f"close_{session['session_id']}",
-            ):
-                close_session(session["session_id"])
-                st.success("Session closed. Its attendance register remains available.")
-                st.rerun()
+        if active:
+            st.caption("Use Manage a session below to edit, close, reopen or delete a class.")
 
     st.divider()
     st.subheader("Session history")
@@ -997,6 +1059,74 @@ def page_sessions() -> None:
             hide_index=True,
         )
 
+        st.markdown("#### Manage a session")
+        session_map = {session_label(session): session for session in sessions}
+        managed_label = st.selectbox("Class session record", list(session_map), key="managed_session")
+        managed = session_map[managed_label]
+        managed_start = datetime.fromisoformat(managed["starts_at"])
+        edit_tab, delete_tab = st.tabs(["Edit session", "Delete session"])
+        with edit_tab:
+            with st.form(f"edit_session_{managed['session_id']}"):
+                edit_code = st.text_input("Course code", value=managed["course_code"])
+                edit_name = st.text_input("Course name", value=managed["course_name"])
+                edit_venue = st.text_input("Venue", value=managed["venue"])
+                edit_lecturer = st.text_input("Lecturer", value=managed["lecturer"])
+                date_column, time_column = st.columns(2)
+                edit_date = date_column.date_input("Date", value=managed_start.date())
+                edit_time = time_column.time_input("Start time", value=managed_start.time())
+                edit_grace = st.number_input(
+                    "On-time grace period (minutes)",
+                    min_value=0,
+                    max_value=60,
+                    value=int(managed["grace_minutes"]),
+                    step=5,
+                )
+                edit_active = st.checkbox(
+                    "Session is open for attendance",
+                    value=bool(managed["active"]),
+                    help="Clear this to close the session. Select it again later to reopen the session.",
+                )
+                save_session = st.form_submit_button("Save session changes", type="primary", width="stretch")
+            if save_session:
+                if not all(value.strip() for value in (edit_code, edit_name, edit_venue, edit_lecturer)):
+                    st.error("Course, venue and lecturer fields are required.")
+                else:
+                    starts_at = datetime.combine(edit_date, edit_time).astimezone()
+                    update_session(
+                        managed["session_id"],
+                        {
+                            "course_code": edit_code,
+                            "course_name": edit_name,
+                            "venue": edit_venue,
+                            "lecturer": edit_lecturer,
+                            "starts_at": starts_at,
+                            "grace_minutes": int(edit_grace),
+                            "active": edit_active,
+                            "ends_at": managed.get("ends_at"),
+                        },
+                    )
+                    st.success("Session updated.")
+                    st.rerun()
+        with delete_tab:
+            st.warning(
+                f"Deleting session #{managed['session_id']} also removes its "
+                f"{managed['attendance_count']} attendance record(s). This cannot be undone."
+            )
+            confirm_session_delete = st.checkbox(
+                f"I understand and want to delete session #{managed['session_id']}",
+                key=f"confirm_session_delete_{managed['session_id']}",
+            )
+            if st.button(
+                "Delete session permanently",
+                key=f"delete_session_{managed['session_id']}",
+                disabled=not confirm_session_delete,
+                width="stretch",
+            ):
+                delete_session(managed["session_id"])
+                st.session_state.pop("last_scan", None)
+                st.success("Session and its attendance records were deleted.")
+                st.rerun()
+
 
 def page_records() -> None:
     page_header(
@@ -1010,102 +1140,119 @@ def page_records() -> None:
         st.info("Create a class session before attendance records can be produced.")
         return
 
-    session_options = {"All verified records": None}
-    session_options.update({session_label(session): session["session_id"] for session in sessions})
-    filters = st.columns([1.4, 1])
-    chosen = filters[0].selectbox("Class session", list(session_options))
-    search = filters[1].text_input("Search student or programme", placeholder="Name, ID or programme")
-    selected_id = session_options[chosen]
+    session_map = {session_label(session): session for session in sessions}
+    with st.container(border=True):
+        st.markdown("#### Choose a class session")
+        filter_columns = st.columns([1.45, 1])
+        chosen = filter_columns[0].selectbox("Class session", list(session_map))
+        search = filter_columns[1].text_input(
+            "Search within this session", placeholder="Student name, ID or programme"
+        )
+    session = session_map[chosen]
+    selected_id = int(session["session_id"])
 
-    if selected_id is None:
-        records = attendance_records(search=search)
-        frame = results_dataframe(records)
-        total = len(records)
-        present = sum(record["attendance_status"] == "Present" for record in records)
-        late = sum(record["attendance_status"] == "Late" for record in records)
-        stats = st.columns(3)
+    roster = session_roster(selected_id)
+    if search.strip():
+        term = search.casefold()
+        roster = [
+            row
+            for row in roster
+            if term in row["student_id"].casefold()
+            or term in row["full_name"].casefold()
+            or term in row["programme"].casefold()
+        ]
+    present = sum(row["attendance_status"] == "Present" for row in roster)
+    late = sum(row["attendance_status"] == "Late" for row in roster)
+    absent = sum(row["attendance_status"] == "Absent" for row in roster)
+    rate = (present + late) / len(roster) if roster else 0
+
+    st.markdown('<div class="ui-spacer"></div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(f"### Session #{selected_id}: {session['course_code']} / {session['course_name']}")
+        st.caption(
+            f"{fmt_datetime(session['starts_at'])} · {session['venue']} · {session['lecturer']} · "
+            f"{'Open for attendance' if session['active'] else 'Closed session'}"
+        )
+        stats = st.columns(4)
         with stats[0]:
-            stat_card("Verified records", str(total), "Across every class session")
+            stat_card("Session roster", str(len(roster)), f"Session #{selected_id}")
         with stats[1]:
             stat_card("Present", str(present), "Within the grace period")
         with stats[2]:
             stat_card("Late", str(late), "After the grace period")
-        if not frame.empty:
-            st.dataframe(frame, width="stretch", hide_index=True)
-            st.download_button(
-                "Download verified records (CSV)",
-                data=frame.to_csv(index=False).encode("utf-8"),
-                file_name="attendance_records.csv",
-                mime="text/csv",
-            )
-        else:
-            st.caption("No verified attendance matches the current filter.")
-    else:
-        session = get_session(selected_id)
-        roster = session_roster(selected_id)
-        if search.strip():
-            term = search.casefold()
-            roster = [
-                row
-                for row in roster
-                if term in row["student_id"].casefold()
-                or term in row["full_name"].casefold()
-                or term in row["programme"].casefold()
-            ]
-        present = sum(row["attendance_status"] == "Present" for row in roster)
-        late = sum(row["attendance_status"] == "Late" for row in roster)
-        absent = sum(row["attendance_status"] == "Absent" for row in roster)
-        stats = st.columns(4)
-        with stats[0]:
-            stat_card("Roster", str(len(roster)), f"{session['course_code']} enrolled identities")
-        with stats[1]:
-            stat_card("Present", str(present), "Within the grace period")
-        with stats[2]:
-            stat_card("Late", str(late), "Verified after the grace period")
         with stats[3]:
-            rate = (present + late) / len(roster) if roster else 0
             stat_card("Attendance rate", f"{rate:.0%}", f"{absent} absent")
+        st.caption(
+            "A database uniqueness rule permits only one attendance entry for each student in this session."
+        )
 
-        frame = pd.DataFrame(roster)
-        if not frame.empty:
-            display = frame.rename(
-                columns={
-                    "student_id": "Student ID",
-                    "full_name": "Student",
-                    "programme": "Programme",
-                    "study_year": "Year",
-                    "tutorial_group": "Group",
-                    "attendance_status": "Status",
-                    "marked_at": "Marked at",
-                    "similarity": "Match",
-                    "capture_quality": "Quality",
-                }
-            )
-            display["Marked at"] = display["Marked at"].map(fmt_datetime)
-            display["Match"] = display["Match"].map(lambda value: f"{float(value):.1%}" if pd.notna(value) else "-")
-            display["Quality"] = display["Quality"].map(lambda value: f"{float(value):.1%}" if pd.notna(value) else "-")
+    frame = pd.DataFrame(roster)
+    if not frame.empty:
+        display = frame.rename(
+            columns={
+                "student_id": "Student ID",
+                "full_name": "Student",
+                "programme": "Programme",
+                "study_year": "Year",
+                "tutorial_group": "Group",
+                "attendance_status": "Status",
+                "marked_at": "Marked at",
+                "similarity": "Match",
+                "capture_quality": "Quality",
+            }
+        )
+        display.insert(0, "Session", f"#{selected_id} · {session['course_code']}")
+        display["Marked at"] = display["Marked at"].map(fmt_datetime)
+        display["Match"] = display["Match"].map(lambda value: f"{float(value):.1%}" if pd.notna(value) else "-")
+        display["Quality"] = display["Quality"].map(lambda value: f"{float(value):.1%}" if pd.notna(value) else "-")
+        st.markdown('<div class="ui-spacer"></div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown("### Student attendance register")
+            st.caption("Present, late and absent students for the selected session are listed together.")
             st.dataframe(
-                display[["Student ID", "Student", "Programme", "Year", "Group", "Status", "Marked at", "Match", "Quality"]],
+                display[["Session", "Student ID", "Student", "Programme", "Year", "Group", "Status", "Marked at", "Match", "Quality"]],
                 width="stretch",
                 hide_index=True,
             )
-            csv_data = display.to_csv(index=False).encode("utf-8")
+        csv_data = display.to_csv(index=False).encode("utf-8")
+        pdf_bytes = build_attendance_pdf(session, roster)
+        st.markdown('<div class="ui-spacer"></div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown("### Export this session")
+            st.caption("Download the same selected-session register for spreadsheet review or printing.")
             export_columns = st.columns(2)
             export_columns[0].download_button(
-                "Download class register (CSV)",
+                "Download CSV register",
                 data=csv_data,
-                file_name=f"{session['course_code']}_attendance.csv",
+                file_name=f"session_{selected_id}_{session['course_code']}_attendance.csv",
                 mime="text/csv",
                 width="stretch",
             )
-            pdf_bytes = build_attendance_pdf(session, roster)
             export_columns[1].download_button(
-                "Download polished attendance report (PDF)",
+                "Download PDF report",
                 data=pdf_bytes,
-                file_name=f"{session['course_code']}_attendance_report.pdf",
+                file_name=f"session_{selected_id}_{session['course_code']}_attendance.pdf",
                 mime="application/pdf",
                 width="stretch",
             )
+
+    st.markdown('<div class="ui-spacer"></div>', unsafe_allow_html=True)
+    with st.expander("All sessions overview"):
+        overview = pd.DataFrame(
+            [
+                {
+                    "Session": f"#{item['session_id']}",
+                    "Course": item["course_code"],
+                    "Course name": item["course_name"],
+                    "Date": fmt_datetime(item["starts_at"]),
+                    "Verified records": int(item["attendance_count"]),
+                    "Late": int(item["late_count"] or 0),
+                    "Status": "Open" if item["active"] else "Closed",
+                }
+                for item in sessions
+            ]
+        )
+        st.dataframe(overview, width="stretch", hide_index=True)
 
 
 def render_studio_result(result: PipelineResult) -> None:

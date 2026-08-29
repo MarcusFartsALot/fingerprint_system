@@ -315,6 +315,81 @@ def list_students(database_path: str | Path = DATABASE_PATH) -> list[dict[str, A
         )
 
 
+def update_student(
+    student_id: str,
+    updates: dict[str, Any],
+    database_path: str | Path = DATABASE_PATH,
+) -> None:
+    """Update editable student details while keeping the biometric identity key stable."""
+
+    canonical_id = student_id.strip().upper()
+    required = ("full_name", "programme", "study_year", "tutorial_group", "status")
+    if not all(str(updates.get(field, "")).strip() for field in required):
+        raise ValueError("Name, programme, year, group and status are required.")
+    if int(updates["study_year"]) not in range(1, 9):
+        raise ValueError("Study year must be between 1 and 8.")
+    now = local_now().isoformat()
+    with connection(database_path) as database:
+        cursor = database.execute(
+            """
+            UPDATE students
+            SET full_name = ?, programme = ?, study_year = ?, tutorial_group = ?,
+                email = ?, status = ?
+            WHERE student_id = ?
+            """,
+            (
+                str(updates["full_name"]).strip(),
+                str(updates["programme"]).strip(),
+                int(updates["study_year"]),
+                str(updates["tutorial_group"]).strip(),
+                str(updates.get("email", "")).strip(),
+                str(updates["status"]).strip(),
+                canonical_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Student {canonical_id} does not exist.")
+        database.execute(
+            "INSERT INTO audit_log(event_type, details, created_at) VALUES (?, ?, ?)",
+            ("student_updated", json.dumps({"student_id": canonical_id}), now),
+        )
+
+
+def delete_student(
+    student_id: str,
+    database_path: str | Path = DATABASE_PATH,
+) -> int:
+    """Delete one student, dependent attendance/templates, and local biometric files."""
+
+    canonical_id = student_id.strip().upper()
+    with connection(database_path) as database:
+        paths = database.execute(
+            "SELECT image_path, reference_path FROM fingerprint_templates WHERE student_id = ?",
+            (canonical_id,),
+        ).fetchall()
+        cursor = database.execute("DELETE FROM students WHERE student_id = ?", (canonical_id,))
+        if cursor.rowcount != 1:
+            raise ValueError(f"Student {canonical_id} does not exist.")
+        database.execute(
+            "INSERT INTO audit_log(event_type, details, created_at) VALUES (?, ?, ?)",
+            ("student_deleted", json.dumps({"student_id": canonical_id}), local_now().isoformat()),
+        )
+
+    # Only remove files located in the application's own biometric directories.
+    allowed_roots = (TEMPLATE_DIR.resolve(), REFERENCE_DIR.resolve())
+    removed = 0
+    for row in paths:
+        for field in ("image_path", "reference_path"):
+            if not row[field]:
+                continue
+            candidate = Path(str(row[field])).resolve()
+            if any(candidate == root or root in candidate.parents for root in allowed_roots):
+                if candidate.is_file():
+                    candidate.unlink()
+                    removed += 1
+    return removed
+
+
 def list_templates(database_path: str | Path = DATABASE_PATH) -> list[dict[str, Any]]:
     with connection(database_path) as database:
         return _rows(
@@ -378,6 +453,60 @@ def close_session(session_id: int, database_path: str | Path = DATABASE_PATH) ->
         database.execute(
             "INSERT INTO audit_log(event_type, details, created_at) VALUES (?, ?, ?)",
             ("session_closed", json.dumps({"session_id": int(session_id)}), now),
+        )
+
+
+def update_session(
+    session_id: int,
+    updates: dict[str, Any],
+    database_path: str | Path = DATABASE_PATH,
+) -> None:
+    """Update class details and its open/closed state."""
+
+    starts_at = updates["starts_at"]
+    if isinstance(starts_at, datetime):
+        starts_at = starts_at.astimezone().isoformat()
+    active = 1 if updates.get("active") else 0
+    ends_at = None if active else (updates.get("ends_at") or local_now().isoformat())
+    now = local_now().isoformat()
+    with connection(database_path) as database:
+        cursor = database.execute(
+            """
+            UPDATE class_sessions
+            SET course_code = ?, course_name = ?, venue = ?, lecturer = ?, starts_at = ?,
+                grace_minutes = ?, active = ?, ends_at = ?
+            WHERE session_id = ?
+            """,
+            (
+                str(updates["course_code"]).strip().upper(),
+                str(updates["course_name"]).strip(),
+                str(updates["venue"]).strip(),
+                str(updates["lecturer"]).strip(),
+                str(starts_at),
+                int(updates.get("grace_minutes", 15)),
+                active,
+                ends_at,
+                int(session_id),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Session {session_id} does not exist.")
+        database.execute(
+            "INSERT INTO audit_log(event_type, details, created_at) VALUES (?, ?, ?)",
+            ("session_updated", json.dumps({"session_id": int(session_id)}), now),
+        )
+
+
+def delete_session(session_id: int, database_path: str | Path = DATABASE_PATH) -> None:
+    """Delete one session and its dependent attendance records."""
+
+    with connection(database_path) as database:
+        cursor = database.execute("DELETE FROM class_sessions WHERE session_id = ?", (int(session_id),))
+        if cursor.rowcount != 1:
+            raise ValueError(f"Session {session_id} does not exist.")
+        database.execute(
+            "INSERT INTO audit_log(event_type, details, created_at) VALUES (?, ?, ?)",
+            ("session_deleted", json.dumps({"session_id": int(session_id)}), local_now().isoformat()),
         )
 
 
