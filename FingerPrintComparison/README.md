@@ -14,7 +14,12 @@ Discussion / Appendix sections.
 | Ang Wei Ee | Gradient-Based Ridge Orientation Estimation | `algorithms.algo1_gradient_orientation` |
 | Lam Yi Ming | Gabor Filtering | `algorithms.algo2_gabor` |
 | Marcus Kong Mun Chun | Short-Time Fourier Transform (STFT) | `algorithms.algo3_stft` |
-| Fong Jun Quan | Structure Tensor / Coherence-Enhancing Diffusion | `algorithms.algo4_structure_tensor` |
+| Fong Jun Quan | Bilateral Edge-Preserving Denoising | `algorithms.algo4_bilateral_denoising` |
+
+Algorithm 4 uses a `5 x 5` bilateral neighbourhood with colour sigma `12`
+and spatial sigma `3`. It is the main denoising filter selected for the
+Student Fingerprint Attendance application because it suppresses small
+camera noise without averaging across strong fingerprint ridge boundaries.
 
 ## Getting started
 

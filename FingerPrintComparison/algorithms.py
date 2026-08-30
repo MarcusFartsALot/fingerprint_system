@@ -9,7 +9,7 @@ documentation.
     Algorithm 1 - Gradient-Based Ridge Orientation Estimation  (Ang Wei Ee)
     Algorithm 2 - Gabor Filtering                               (Lam Yi Ming)
     Algorithm 3 - Short-Time Fourier Transform (STFT)           (Marcus Kong Mun Chun)
-    Algorithm 4 - Structure Tensor / Coherence-Enhancing        (Fong Jun Quan)
+    Algorithm 4 - Bilateral Edge-Preserving Denoising           (Fong Jun Quan)
 
 Every function takes a single-channel uint8 (or float) image and returns
 an enhanced uint8 image (plus auxiliary maps such as orientation/coherence
@@ -314,39 +314,41 @@ def algo3_stft(img, block_size=32, overlap=16, k=0.45):
 
 
 # --------------------------------------------------------------------------- #
-# Algorithm 4 - Structure Tensor (Fong Jun Quan)
+# Algorithm 4 - Bilateral Edge-Preserving Denoising (Fong Jun Quan)
 # --------------------------------------------------------------------------- #
 
-def algo4_structure_tensor(img, sigma=2.0, iterations=6, step=0.35, block_size=16):
+def algo4_bilateral_denoising(
+    img,
+    diameter=5,
+    sigma_color=12.0,
+    sigma_space=3.0,
+):
     """
-    Computes the 2x2 structure tensor J, its eigen-decomposition (coherence
-    C) and drives a simplified Coherence-Enhancing Diffusion: iteratively
-    blends each pixel toward an orientation-aligned smoothed version,
-    weighted by local coherence, following Section 2.4.
+    Reduce local camera/sensor noise while preserving narrow fingerprint
+    ridge boundaries. The spatial Gaussian weight smooths nearby pixels,
+    while the range weight prevents strong intensity edges from being
+    averaged together. These are the same production parameters used by
+    the Student Fingerprint Attendance application.
     """
-    norm = normalize_image(img)
-    gx, gy = compute_gradients(norm)
-    Jxx = cv2.GaussianBlur(gx * gx, (0, 0), sigma)
-    Jxy = cv2.GaussianBlur(gx * gy, (0, 0), sigma)
-    Jyy = cv2.GaussianBlur(gy * gy, (0, 0), sigma)
-
-    tmp = np.sqrt((Jxx - Jyy) ** 2 + 4 * Jxy ** 2)
-    lambda1 = 0.5 * (Jxx + Jyy + tmp)
-    lambda2 = 0.5 * (Jxx + Jyy - tmp)
-    coherence = ((lambda1 - lambda2) / (lambda1 + lambda2 + 1e-8)) ** 2
-    theta = 0.5 * np.arctan2(2 * Jxy, Jxx - Jyy)  # ridge tangent direction (v2)
-
-    enhanced = norm.copy()
-    for _ in range(iterations):
-        smoothed = oriented_smooth(enhanced, theta, block_size=block_size, length=5)
-        enhanced = enhanced * (1 - step * coherence) + smoothed * (step * coherence)
-
-    return to_uint8(enhanced), {"orientation": theta, "coherence": coherence}
+    normalised = to_uint8(normalize_image(img))
+    enhanced = cv2.bilateralFilter(
+        normalised,
+        d=int(diameter),
+        sigmaColor=float(sigma_color),
+        sigmaSpace=float(sigma_space),
+    )
+    removed_noise = cv2.absdiff(normalised, enhanced)
+    return enhanced, {
+        "noise_residual": removed_noise,
+        "diameter": int(diameter),
+        "sigma_color": float(sigma_color),
+        "sigma_space": float(sigma_space),
+    }
 
 
 ALGORITHMS = {
     "Algo 1: Gradient-Based Orientation (Ang Wei Ee)": algo1_gradient_orientation,
     "Algo 2: Gabor Filtering (Lam Yi Ming)": algo2_gabor,
     "Algo 3: STFT (Marcus Kong Mun Chun)": algo3_stft,
-    "Algo 4: Structure Tensor (Fong Jun Quan)": algo4_structure_tensor,
+    "Algo 4: Bilateral Edge-Preserving Denoising (Fong Jun Quan)": algo4_bilateral_denoising,
 }

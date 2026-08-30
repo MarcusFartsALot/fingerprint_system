@@ -21,13 +21,20 @@ Tab 2: Fingerprint Matching — placeholder ("Coming Soon") for the real
 Run with:  streamlit run app.py
 """
 
+import importlib
 import time
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from algorithms import ALGORITHMS, binarize_otsu
+import algorithms as algorithms_module
+
+# Streamlit reruns app.py in the same process; reload the algorithm registry so
+# a changed team algorithm is reflected immediately during comparison work.
+algorithms_module = importlib.reload(algorithms_module)
+ALGORITHMS = algorithms_module.ALGORITHMS
+binarize_otsu = algorithms_module.binarize_otsu
 from evaluation import derive_pseudo_ground_truth_mask, ridge_clarity_score, load_and_resize
 from metrics_utils import (
     compute_classification_metrics,

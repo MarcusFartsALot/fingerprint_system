@@ -36,7 +36,7 @@ def derive_pseudo_ground_truth_mask(img):
     """
     Neutral ridge/valley binarisation used as a stand-in reference standard.
     Deliberately independent of all four candidate algorithms (uses CLAHE +
-    adaptive thresholding, not orientation/Gabor/STFT/structure-tensor) so
+    adaptive thresholding, not orientation/Gabor/STFT/bilateral filtering) so
     that deriving the "ground truth" doesn't secretly favour any of them.
     """
     img_u8 = img.astype(np.uint8)
