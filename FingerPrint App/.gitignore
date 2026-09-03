@@ -17,3 +17,6 @@ data/streamlit-process.json
 data/streamlit-process.pid
 data/streamlit-output.log
 data/streamlit-error.log
+
+# Generated reports and presentation exports
+output/

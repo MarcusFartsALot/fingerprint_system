@@ -23,6 +23,8 @@ import fingerprint_processing as fingerprint_module
 import matching as matching_module
 import database as database_module
 import ui as ui_module
+from scan_analytics import analyse_scan
+from scan_report import build_scan_analytics_pdf
 
 # Streamlit reruns this file in the same Python process. Reload the lightweight
 # persistence module so newly added administration functions are immediately
@@ -172,6 +174,126 @@ def pipeline_payload(result: PipelineResult) -> dict:
         "schema_version": fingerprint_module.PIPELINE_SCHEMA_VERSION,
         "stages": result.stages,
         "quality": result.quality,
+    }
+
+
+def render_upload_selection(
+    uploads,
+    *,
+    generation_state_key: str,
+    button_key: str,
+    state_to_clear: tuple[str, ...] = (),
+) -> None:
+    """Show one consistent upload summary and reset action across the app."""
+
+    if not uploads:
+        return
+    files = uploads if isinstance(uploads, list) else [uploads]
+    file_list = ", ".join(
+        f"{upload.name} ({upload.size / 1024:.1f} KB)" for upload in files
+    )
+    summary, remove_action = st.columns([4, 1.2])
+    with summary:
+        st.success(f"Selected image(s): {file_list}")
+    with remove_action:
+        if st.button("Remove image(s)", key=button_key, width="stretch"):
+            generation = int(st.session_state.get(generation_state_key, 0))
+            st.session_state[generation_state_key] = generation + 1
+            for state_key in state_to_clear:
+                st.session_state.pop(state_key, None)
+            st.rerun()
+
+
+def prepare_enrolment_templates(
+    uploads,
+    student_id: str,
+    finger_label: str,
+    stored_paths: list[Path],
+) -> tuple[list[dict], list[PipelineResult]]:
+    """Enhance enrolment captures and build their database template records."""
+
+    template_rows: list[dict] = []
+    previews: list[PipelineResult] = []
+    for upload in uploads:
+        result = process_fingerprint(upload.getvalue())
+        quality_issue = capture_quality_issue(result)
+        if quality_issue:
+            raise ValueError(f"{upload.name}: {quality_issue}")
+
+        capture_key = f"{student_id.strip().lower()}_{uuid.uuid4().hex[:12]}"
+        template_path = TEMPLATE_DIR / f"{capture_key}_enhanced.png"
+        reference_path = REFERENCE_DIR / f"{capture_key}_reference.png"
+        save_enhanced_template(result, template_path)
+        stored_paths.append(template_path)
+        save_reference_capture(result, reference_path)
+        stored_paths.append(reference_path)
+        template_rows.append(
+            {
+                "finger_label": finger_label,
+                "image_path": str(template_path.resolve()),
+                "reference_path": str(reference_path.resolve()),
+                "quality": result.quality["overall"],
+                "clarity": result.quality["clarity"],
+                "minutiae_count": int(result.quality.get("minutiae_count", 0)),
+                "profile": pipeline_payload(result),
+            }
+        )
+        previews.append(result)
+    return template_rows, previews
+
+
+def process_attendance_scan(
+    source: bytes,
+    session: dict,
+    templates: list[dict],
+    threshold: float,
+    ambiguity_margin: float,
+    source_mode: str,
+) -> dict:
+    """Run enhancement, identity matching, and attendance persistence."""
+
+    started = perf_counter()
+    pipeline = process_fingerprint(source)
+    scan_analytics = analyse_scan(
+        pipeline.prepared,
+        pipeline.enhanced,
+        pipeline.region_mask,
+    )
+    identification = identify_student(
+        pipeline,
+        templates,
+        threshold=threshold,
+        ambiguity_margin=ambiguity_margin,
+    )
+
+    created = False
+    record: dict = {}
+    status = "Not recorded"
+    if identification.matched and identification.student:
+        status = attendance_status(session)
+        created, record = mark_attendance(
+            session["session_id"],
+            identification.student["student_id"],
+            status,
+            identification.evidence.similarity if identification.evidence else 0.0,
+            pipeline.quality["overall"],
+            pipeline.processing_ms,
+        )
+        if not created:
+            status = record["attendance_status"]
+
+    return {
+        "pipeline": pipeline,
+        "identification": identification,
+        "created": created,
+        "record": record,
+        "status": status,
+        "session_label": f"{session['course_code']} / {session['course_name']}",
+        "elapsed_ms": (perf_counter() - started) * 1000.0,
+        "threshold": threshold,
+        "ambiguity_margin": ambiguity_margin,
+        "scan_analytics": scan_analytics,
+        "source_mode": source_mode,
     }
 
 
@@ -529,6 +651,66 @@ def render_scan_result(payload: dict) -> None:
             "The score supports a classroom prototype and is not a forensic biometric certification."
         )
 
+        analytics = payload.get("scan_analytics")
+        if analytics:
+            st.divider()
+            st.markdown("#### Live Scan Analytics & Visualisations")
+            st.caption(
+                "Real-time processing metrics calculated against an independent ridge reference "
+                "derived from this exact scan. These are filter diagnostics, not student-identification accuracy."
+            )
+            matrix_column, metrics_column = st.columns(2, gap="large")
+            with matrix_column:
+                st.markdown("**Confusion Matrix (Ridge vs Valley)**")
+                matrix = pd.DataFrame(
+                    analytics["confusion_matrix"],
+                    index=["Actual: Valley (0)", "Actual: Ridge (1)"],
+                    columns=["Pred: Valley (0)", "Pred: Ridge (1)"],
+                )
+                st.dataframe(matrix, width="stretch")
+                st.caption(f"Calculated within {analytics['roi_pixels']:,} foreground pixels.")
+            with metrics_column:
+                st.markdown("**Classification Metrics**")
+                metric_frame = pd.DataFrame.from_dict(
+                    analytics["metrics"],
+                    orient="index",
+                    columns=["Score"],
+                )
+                st.bar_chart(metric_frame, height=300)
+
+            st.markdown("**Pixel Intensity Histogram (Original vs Enhanced)**")
+            histogram = pd.DataFrame(
+                {
+                    "Original (Prepared)": analytics["prepared_histogram"],
+                    "Enhanced (Binary)": analytics["enhanced_histogram"],
+                },
+                index=analytics["histogram_centres"],
+            )
+            histogram.index.name = "Pixel intensity (0 black, 255 white)"
+            st.bar_chart(histogram, stack=True, height=320)
+
+            st.markdown("**Export Analytics**")
+            student = identification.student or {}
+            scan_analytics_pdf = build_scan_analytics_pdf(
+                analytics,
+                {
+                    "Session": payload["session_label"],
+                    "Scan source": payload.get("source_mode", "Fingerprint upload"),
+                    "Matched student": student.get("full_name", "Unidentified"),
+                    "Student ID": student.get("student_id", "Unidentified"),
+                    "Match score": f"{similarity:.1%}",
+                    "Acceptance threshold": f"{payload.get('threshold', DEFAULT_MATCH_THRESHOLD):.1%}",
+                },
+                float(payload["elapsed_ms"]),
+            )
+            st.download_button(
+                "Download Scan Analytics PDF",
+                data=scan_analytics_pdf,
+                file_name=f"scan_analytics_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf",
+                key="download_scan_analytics_pdf",
+            )
+
 
 def page_mark_attendance() -> None:
     page_header(
@@ -574,14 +756,23 @@ def page_mark_attendance() -> None:
     automatic_camera_verification = False
     camera_digest = None
     if source_mode == "Upload fingerprint photo":
-        uploaded = st.file_uploader(
-            "Drop a fingerprint capture",
-            type=IMAGE_TYPES,
-            accept_multiple_files=False,
-            help="PNG, JPG, BMP or TIFF. Greyscale conversion is automatic.",
-        )
-        if uploaded:
-            source = uploaded.getvalue()
+        upload_generation = int(st.session_state.get("attendance_upload_generation", 0))
+        with st.container(key="attendance_single_upload"):
+            uploaded = st.file_uploader(
+                "Upload one fingerprint photo",
+                type=IMAGE_TYPES,
+                accept_multiple_files=False,
+                help="PNG, JPG, BMP or TIFF. Greyscale conversion is automatic.",
+                key=f"attendance_upload_{upload_generation}",
+            )
+            if uploaded:
+                source = uploaded.getvalue()
+                render_upload_selection(
+                    uploaded,
+                    generation_state_key="attendance_upload_generation",
+                    button_key=f"remove_attendance_upload_{upload_generation}",
+                    state_to_clear=("last_scan",),
+                )
     elif source_mode == "Live camera capture":
         st.info(
             "Place the enrolled fingertip in the centre, fill most of the frame and keep the ridges in focus. "
@@ -609,49 +800,24 @@ def page_mark_attendance() -> None:
         )
 
     if manual_verification or automatic_camera_verification:
+        templates = list_templates()
         if source is None:
             st.warning("Provide a fingerprint capture first.")
-        elif not list_templates():
+        elif not templates:
             st.warning("No enrolled fingerprint templates are available.")
         else:
             if camera_digest:
                 st.session_state["last_live_camera_digest"] = camera_digest
             try:
-                started = perf_counter()
                 with st.spinner("Enhancing ridges and comparing enrolled templates..."):
-                    pipeline = process_fingerprint(source)
-                    identification = identify_student(
-                        pipeline,
-                        list_templates(),
-                        threshold=threshold,
-                        ambiguity_margin=ambiguity,
+                    st.session_state["last_scan"] = process_attendance_scan(
+                        source,
+                        selected_session,
+                        templates,
+                        threshold,
+                        ambiguity,
+                        source_mode,
                     )
-                    created = False
-                    record = {}
-                    status = "Not recorded"
-                    if identification.matched and identification.student:
-                        status = attendance_status(selected_session)
-                        created, record = mark_attendance(
-                            selected_session["session_id"],
-                            identification.student["student_id"],
-                            status,
-                            identification.evidence.similarity if identification.evidence else 0.0,
-                            pipeline.quality["overall"],
-                            pipeline.processing_ms,
-                        )
-                        if not created:
-                            status = record["attendance_status"]
-                st.session_state["last_scan"] = {
-                    "pipeline": pipeline,
-                    "identification": identification,
-                    "created": created,
-                    "record": record,
-                    "status": status,
-                    "session_label": f"{selected_session['course_code']} / {selected_session['course_name']}",
-                    "elapsed_ms": (perf_counter() - started) * 1000.0,
-                    "threshold": threshold,
-                    "ambiguity_margin": ambiguity,
-                }
             except ValueError as exc:
                 st.error(str(exc))
             except Exception as exc:
@@ -673,7 +839,8 @@ def page_enrolment() -> None:
     left, right = st.columns([1.05, 1], gap="large")
     with left:
         st.subheader("New biometric identity")
-        with st.form("enrolment_form", clear_on_submit=False):
+        enrolment_upload_generation = int(st.session_state.get("enrolment_upload_generation", 0))
+        with st.container(border=True):
             first, second = st.columns(2)
             student_id = first.text_input("Student ID", placeholder="e.g. 2510012")
             full_name = second.text_input("Full name", placeholder="As shown in university records")
@@ -686,12 +853,26 @@ def page_enrolment() -> None:
                 "Enrolled finger",
                 ["Right index", "Left index", "Right thumb", "Left thumb", "Other"],
             )
-            uploads = st.file_uploader(
-                "Fingerprint captures (1-3 of the same finger)",
-                type=IMAGE_TYPES,
-                accept_multiple_files=True,
+            with st.container(key="enrolment_upload_panel"):
+                uploads = st.file_uploader(
+                    "Fingerprint captures (1-3 of the same finger)",
+                    type=IMAGE_TYPES,
+                    accept_multiple_files=True,
+                    key=f"enrolment_upload_{enrolment_upload_generation}",
+                )
+                if uploads:
+                    render_upload_selection(
+                        uploads,
+                        generation_state_key="enrolment_upload_generation",
+                        button_key=f"remove_enrolment_uploads_{enrolment_upload_generation}",
+                        state_to_clear=("enrolment_preview",),
+                    )
+            submitted = st.button(
+                "Process and enrol student",
+                type="primary",
+                width="stretch",
+                key="process_enrolment",
             )
-            submitted = st.form_submit_button("Process and enrol student", type="primary", width="stretch")
 
         if submitted:
             errors = []
@@ -714,33 +895,13 @@ def page_enrolment() -> None:
             else:
                 stored_paths: list[Path] = []
                 try:
-                    template_rows = []
-                    preview_results = []
                     with st.spinner("Running ridge-preserving enhancement and quality checks..."):
-                        for upload in uploads:
-                            result = process_fingerprint(upload.getvalue())
-                            quality_issue = capture_quality_issue(result)
-                            if quality_issue:
-                                raise ValueError(f"{upload.name}: {quality_issue}")
-                            capture_key = f"{student_id.strip().lower()}_{uuid.uuid4().hex[:12]}"
-                            path = TEMPLATE_DIR / f"{capture_key}_enhanced.png"
-                            reference_path = REFERENCE_DIR / f"{capture_key}_reference.png"
-                            save_enhanced_template(result, path)
-                            stored_paths.append(path)
-                            save_reference_capture(result, reference_path)
-                            stored_paths.append(reference_path)
-                            template_rows.append(
-                                {
-                                    "finger_label": finger_label,
-                                    "image_path": str(path.resolve()),
-                                    "reference_path": str(reference_path.resolve()),
-                                    "quality": result.quality["overall"],
-                                    "clarity": result.quality["clarity"],
-                                    "minutiae_count": int(result.quality.get("minutiae_count", 0)),
-                                    "profile": pipeline_payload(result),
-                                }
-                            )
-                            preview_results.append(result)
+                        template_rows, preview_results = prepare_enrolment_templates(
+                            uploads,
+                            student_id,
+                            finger_label,
+                            stored_paths,
+                        )
                         enrol_student(
                             {
                                 "student_id": student_id,
@@ -831,12 +992,22 @@ def page_enrolment() -> None:
                 ["Right index", "Left index", "Right thumb", "Left thumb", "Other"],
                 key="existing_fingerprint_label",
             )
-            existing_uploads = st.file_uploader(
-                "New fingerprint captures (1-3 of the same finger)",
-                type=IMAGE_TYPES,
-                accept_multiple_files=True,
-                key="existing_fingerprint_uploads",
+            existing_upload_generation = int(
+                st.session_state.get("existing_upload_generation", 0)
             )
+            with st.container(key="enrolment_existing_upload_panel"):
+                existing_uploads = st.file_uploader(
+                    "New fingerprint captures (1-3 of the same finger)",
+                    type=IMAGE_TYPES,
+                    accept_multiple_files=True,
+                    key=f"existing_fingerprint_uploads_{existing_upload_generation}",
+                )
+                render_upload_selection(
+                    existing_uploads,
+                    generation_state_key="existing_upload_generation",
+                    button_key=f"remove_existing_uploads_{existing_upload_generation}",
+                    state_to_clear=("enrolment_preview",),
+                )
             if st.button("Process and add canonical references", type="primary"):
                 if not existing_uploads:
                     st.warning("Upload at least one new fingerprint capture.")
@@ -846,35 +1017,13 @@ def page_enrolment() -> None:
                     stored_paths: list[Path] = []
                     try:
                         selected_student = student_map[selected_student_label]
-                        template_rows = []
-                        previews = []
                         with st.spinner("Creating current-format reference captures..."):
-                            for upload in existing_uploads:
-                                result = process_fingerprint(upload.getvalue())
-                                quality_issue = capture_quality_issue(result)
-                                if quality_issue:
-                                    raise ValueError(f"{upload.name}: {quality_issue}")
-                                capture_key = (
-                                    f"{selected_student['student_id'].lower()}_"
-                                    f"{uuid.uuid4().hex[:12]}"
-                                )
-                                template_path = TEMPLATE_DIR / f"{capture_key}_enhanced.png"
-                                reference_path = REFERENCE_DIR / f"{capture_key}_reference.png"
-                                save_enhanced_template(result, template_path)
-                                save_reference_capture(result, reference_path)
-                                stored_paths.extend([template_path, reference_path])
-                                template_rows.append(
-                                    {
-                                        "finger_label": existing_finger,
-                                        "image_path": str(template_path.resolve()),
-                                        "reference_path": str(reference_path.resolve()),
-                                        "quality": result.quality["overall"],
-                                        "clarity": result.quality["clarity"],
-                                        "minutiae_count": int(result.quality.get("minutiae_count", 0)),
-                                        "profile": pipeline_payload(result),
-                                    }
-                                )
-                                previews.append(result)
+                            template_rows, previews = prepare_enrolment_templates(
+                                existing_uploads,
+                                selected_student["student_id"],
+                                existing_finger,
+                                stored_paths,
+                            )
                             add_fingerprint_templates(
                                 selected_student["student_id"],
                                 template_rows,
@@ -1309,7 +1458,21 @@ def page_algorithm_studio() -> None:
         "The numbered cards are the complete executed order. Matching remains a separate attendance operation after enhancement."
     )
 
-    upload = st.file_uploader("Analyse a fingerprint image", type=IMAGE_TYPES, key="studio_upload")
+    studio_upload_generation = int(st.session_state.get("studio_upload_generation", 0))
+    with st.container(key="studio_upload_panel"):
+        upload = st.file_uploader(
+            "Analyse a fingerprint image",
+            type=IMAGE_TYPES,
+            accept_multiple_files=False,
+            key=f"studio_upload_{studio_upload_generation}",
+        )
+        if upload:
+            render_upload_selection(
+                upload,
+                generation_state_key="studio_upload_generation",
+                button_key=f"remove_studio_upload_{studio_upload_generation}",
+                state_to_clear=("studio_result",),
+            )
     if st.button("Run live enhancement diagnostics", type="primary"):
         if not upload:
             st.warning("Upload a fingerprint image first.")

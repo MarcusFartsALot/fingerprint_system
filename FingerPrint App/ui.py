@@ -193,7 +193,7 @@ def apply_theme() -> None:
         .stButton > button,
         .stDownloadButton > button,
         [data-testid="stFormSubmitButton"] button,
-        [data-testid="stFileUploader"] button,
+        [data-testid="stFileUploaderDropzone"] button,
         [data-testid="stCameraInput"] button {
             border-radius: 11px !important;
             min-height: 2.55rem;
@@ -206,7 +206,7 @@ def apply_theme() -> None:
         .stButton > button *,
         .stDownloadButton > button *,
         [data-testid="stFormSubmitButton"] button *,
-        [data-testid="stFileUploader"] button *,
+        [data-testid="stFileUploaderDropzone"] button *,
         [data-testid="stCameraInput"] button * {
             color: #03110a !important;
             fill: #03110a !important;
@@ -215,7 +215,7 @@ def apply_theme() -> None:
         .stButton > button:hover,
         .stDownloadButton > button:hover,
         [data-testid="stFormSubmitButton"] button:hover,
-        [data-testid="stFileUploader"] button:hover,
+        [data-testid="stFileUploaderDropzone"] button:hover,
         [data-testid="stCameraInput"] button:hover {
             background: #62e4ad !important;
             border-color: #62e4ad !important;
@@ -223,12 +223,32 @@ def apply_theme() -> None:
         }
         .stButton > button:disabled,
         [data-testid="stFormSubmitButton"] button:disabled,
-        [data-testid="stFileUploader"] button:disabled,
+        [data-testid="stFileUploaderDropzone"] button:disabled,
         [data-testid="stCameraInput"] button:disabled {
             background: #788a81 !important;
             border-color: #788a81 !important;
             color: #06100b !important;
             cursor: not-allowed !important;
+        }
+        /* Hide Streamlit's small duplicate uploader actions. Each upload panel
+           provides the same clearly labelled reset button below the file list. */
+        .st-key-attendance_single_upload [data-testid="stFileUploaderFile"] button,
+        .st-key-attendance_single_upload [data-testid="stFileUploaderDeleteBtn"],
+        .st-key-attendance_single_upload button[aria-label^="Remove "],
+        .st-key-attendance_single_upload button[aria-label="Add files"],
+        .st-key-enrolment_upload_panel [data-testid="stFileUploaderFile"] button,
+        .st-key-enrolment_upload_panel [data-testid="stFileUploaderDeleteBtn"],
+        .st-key-enrolment_upload_panel button[aria-label^="Remove "],
+        .st-key-enrolment_upload_panel button[aria-label="Add files"],
+        .st-key-enrolment_existing_upload_panel [data-testid="stFileUploaderFile"] button,
+        .st-key-enrolment_existing_upload_panel [data-testid="stFileUploaderDeleteBtn"],
+        .st-key-enrolment_existing_upload_panel button[aria-label^="Remove "],
+        .st-key-enrolment_existing_upload_panel button[aria-label="Add files"],
+        .st-key-studio_upload_panel [data-testid="stFileUploaderFile"] button,
+        .st-key-studio_upload_panel [data-testid="stFileUploaderDeleteBtn"],
+        .st-key-studio_upload_panel button[aria-label^="Remove "],
+        .st-key-studio_upload_panel button[aria-label="Add files"] {
+            display: none !important;
         }
         [data-baseweb="select"] > div, .stTextInput input, .stNumberInput input, .stDateInput input, .stTimeInput input {
             background-color: #101c17 !important;
